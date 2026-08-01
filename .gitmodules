@@ -1,3 +1,6 @@
 [submodule "lib/baremetal-nn"]
 	path = lib/baremetal-nn
 	url = https://github.com/ucb-bar/Baremetal-NN.git
+[submodule "whisper"]
+	path = whisper
+	url = org-14957082@github.com:openai/whisper.git
