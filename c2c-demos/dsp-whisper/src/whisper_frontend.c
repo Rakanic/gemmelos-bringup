@@ -75,11 +75,20 @@ void whisper_frontend_init(void) {
   g_inited = 1;
 }
 
+/* Mel filterbank + log10 for one frame's power spectrum. */
+static void mel_from_power(const float *power, float *out_mel) {
+  for (int m = 0; m < WF_N_MELS; m++) {
+    const float *mf = &wf_mel_filter[m * WF_N_BINS];
+    float acc = 0.0f;
+    for (int k = 0; k < WF_N_BINS; k++) acc += mf[k] * power[k];
+    if (acc < 1e-10f) acc = 1e-10f;
+    out_mel[m] = log10f(acc);
+  }
+}
+
 void whisper_logmel_frame(const float *frame, float *out_mel) {
   float win[WF_N_FFT];
-  for (int n = 0; n < WF_N_FFT; n++) {
-    win[n] = frame[n] * wf_hann[n];
-  }
+  for (int n = 0; n < WF_N_FFT; n++) win[n] = frame[n] * wf_hann[n];
 
   float power[WF_N_BINS];
 #if WHISPER_FE_RVV
@@ -112,29 +121,61 @@ void whisper_logmel_frame(const float *frame, float *out_mel) {
     power[k] = re * re + im * im;
   }
 #endif
-
-  for (int m = 0; m < WF_N_MELS; m++) {
-    const float *mf = &wf_mel_filter[m * WF_N_BINS];
-    float acc = 0.0f;
-    for (int k = 0; k < WF_N_BINS; k++) {
-      acc += mf[k] * power[k];
-    }
-    if (acc < 1e-10f) acc = 1e-10f;
-    out_mel[m] = log10f(acc);
-  }
+  mel_from_power(power, out_mel);
 }
+
+#if WHISPER_FE_RVV
+/* Batched 2-frame DFT: each twiddle vector is loaded ONCE and reused across both frames — halves the
+ * 640 KB-table DRAM traffic (the front-end's memory bottleneck) and uses the idle half of the vector
+ * register file (4 accumulators instead of 2). Identical math to whisper_logmel_frame. */
+static void whisper_logmel_frame2(const float *frame0, const float *frame1,
+                                  float *out_mel0, float *out_mel1) {
+  float win0[WF_N_FFT], win1[WF_N_FFT];
+  for (int n = 0; n < WF_N_FFT; n++) { win0[n] = frame0[n] * wf_hann[n]; win1[n] = frame1[n] * wf_hann[n]; }
+
+  float power0[WF_N_BINS], power1[WF_N_BINS];
+  for (int k0 = 0; k0 < WF_N_BINS;) {
+    size_t vl = __riscv_vsetvl_e32m4((size_t)(WF_N_BINS - k0));
+    vfloat32m4_t re0 = __riscv_vfmv_v_f_f32m4(0.0f, vl), im0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+    vfloat32m4_t re1 = __riscv_vfmv_v_f_f32m4(0.0f, vl), im1 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+    for (int n = 0; n < WF_N_FFT; n++) {
+      vfloat32m4_t cv = __riscv_vle32_v_f32m4(&g_dft_cosT[(size_t)n * WF_N_BINS + k0], vl);
+      vfloat32m4_t sv = __riscv_vle32_v_f32m4(&g_dft_sinT[(size_t)n * WF_N_BINS + k0], vl);
+      re0 = __riscv_vfmacc_vf_f32m4(re0, win0[n], cv, vl); im0 = __riscv_vfnmsac_vf_f32m4(im0, win0[n], sv, vl);
+      re1 = __riscv_vfmacc_vf_f32m4(re1, win1[n], cv, vl); im1 = __riscv_vfnmsac_vf_f32m4(im1, win1[n], sv, vl);
+    }
+    vfloat32m4_t p0 = __riscv_vfmacc_vv_f32m4(__riscv_vfmul_vv_f32m4(re0, re0, vl), im0, im0, vl);
+    vfloat32m4_t p1 = __riscv_vfmacc_vv_f32m4(__riscv_vfmul_vv_f32m4(re1, re1, vl), im1, im1, vl);
+    __riscv_vse32_v_f32m4(&power0[k0], p0, vl);
+    __riscv_vse32_v_f32m4(&power1[k0], p1, vl);
+    k0 += (int)vl;
+  }
+  mel_from_power(power0, out_mel0);
+  mel_from_power(power1, out_mel1);
+}
+#endif
 
 /* Compute log-mel for a frame range [f0,f1) into out_mel (coeff-major) and return the local max.
  * Frames are independent (each writes its own column), so two harts can split the range with no
  * shared writes — only the gmax reduction is combined by the caller. */
 static float logmel_frame_range(const float *pad, float *out_mel, int n_frames, int f0, int f1) {
-  float tmp[WF_N_MELS];
+  float tmp0[WF_N_MELS], tmp1[WF_N_MELS];
   float gmax = -1e30f;
-  for (int f = f0; f < f1; f++) {
-    whisper_logmel_frame(&pad[f * WF_HOP], tmp);
+  int f = f0;
+#if WHISPER_FE_RVV
+  for (; f + 2 <= f1; f += 2) {   /* two frames per twiddle-table pass */
+    whisper_logmel_frame2(&pad[(size_t)f * WF_HOP], &pad[(size_t)(f + 1) * WF_HOP], tmp0, tmp1);
     for (int m = 0; m < WF_N_MELS; m++) {
-      out_mel[(size_t)m * n_frames + f] = tmp[m];
-      if (tmp[m] > gmax) gmax = tmp[m];
+      out_mel[(size_t)m * n_frames + f]     = tmp0[m]; if (tmp0[m] > gmax) gmax = tmp0[m];
+      out_mel[(size_t)m * n_frames + f + 1] = tmp1[m]; if (tmp1[m] > gmax) gmax = tmp1[m];
+    }
+  }
+#endif
+  for (; f < f1; f++) {
+    whisper_logmel_frame(&pad[(size_t)f * WF_HOP], tmp0);
+    for (int m = 0; m < WF_N_MELS; m++) {
+      out_mel[(size_t)m * n_frames + f] = tmp0[m];
+      if (tmp0[m] > gmax) gmax = tmp0[m];
     }
   }
   return gmax;

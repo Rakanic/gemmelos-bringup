@@ -104,13 +104,13 @@
 #ifndef DSP_WHISPER_VAD_LOG_EVERY
 #define DSP_WHISPER_VAD_LOG_EVERY 25u
 #endif
-/* End-of-speech detection: stop capturing once energy stays below END_THRESHOLD for HANGOVER frames.
- * DISABLED by default: it was cutting after the first ~300 ms inter-word gap, so the encoder only saw
- * a fraction of a word and Whisper collapsed to a repeated token. Whisper is trained on 30 s windows
- * zero-padded, so trailing silence is harmless — capturing a FIXED ~2 s window after onset is far more
- * robust than aggressive end-cutting. Re-enable (with a long HANGOVER) only if latency demands it. */
+/* End-of-speech detection: stop capturing (and trim trailing silence, mic_capture) once energy stays
+ * below END_THRESHOLD for HANGOVER frames. ENABLED with a LONG 800 ms hangover so brief inter-word gaps
+ * don't cut (the earlier 300 ms hangover starved the encoder -> a fraction of a word -> repeated-token
+ * collapse). Trimming to the actual utterance cuts encoder positions (its dominant fixed cost) ~in half
+ * for short commands, which is the lever for the 3-token decode latency. */
 #ifndef DSP_WHISPER_VAD_END_ENABLE
-#define DSP_WHISPER_VAD_END_ENABLE 0
+#define DSP_WHISPER_VAD_END_ENABLE 1
 #endif
 #ifndef DSP_WHISPER_VAD_END_THRESHOLD
 #define DSP_WHISPER_VAD_END_THRESHOLD 8.0e-4f
@@ -119,7 +119,7 @@
 #define DSP_WHISPER_VAD_HANGOVER_FRAMES 40u   /* ~800 ms of silence at 320-sample (20 ms) frames */
 #endif
 #ifndef DSP_WHISPER_VAD_MIN_SAMPLES
-#define DSP_WHISPER_VAD_MIN_SAMPLES 24000u    /* >= 1.5 s captured before end-detect can fire */
+#define DSP_WHISPER_VAD_MIN_SAMPLES 8000u     /* >= 0.5 s captured before end-detect can fire */
 #endif
 
 #endif /* C2C_DSP_WHISPER_CONFIG_H */

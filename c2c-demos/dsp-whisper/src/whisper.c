@@ -68,6 +68,31 @@
 #ifndef WHISPER_TILE_MR
 #define WHISPER_TILE_MR 4        /* output positions per weight-vector load (register-blocked) */
 #endif
+/* int4 weights for the bandwidth-bound reduction path (classifier + decoder matvecs). Halves the weight
+ * DRAM stream there. Built lazily by re-quantizing the Q8_0 weights per WHISPER_INT4_GS-element group.
+ * The tiled encoder stays int8 (compute-bound; int4 wouldn't help it). Only applied to matmuls with at
+ * least WHISPER_INT4_MIN_OUT outputs (the big ones — classifier 51864, mlp 1536). */
+#ifndef WHISPER_INT4
+#define WHISPER_INT4 0
+#endif
+#ifndef WHISPER_INT4_GS
+#define WHISPER_INT4_GS 32       /* int4 group size (finer than the int8 gs=64 to keep accuracy) */
+#endif
+#ifndef WHISPER_INT4_MIN_OUT
+#define WHISPER_INT4_MIN_OUT 384 /* only repack matmuls whose output dim >= this */
+#endif
+/* Anti-loop for greedy decode on marginal/non-speech audio (no eot). no-repeat-ngram bans any token
+ * that would recreate a previously-seen N-gram (prevents the loop forming); the diversity cutoff is a
+ * backstop that stops when the recent window collapses to few unique tokens. */
+#ifndef WHISPER_NO_REPEAT_NGRAM
+#define WHISPER_NO_REPEAT_NGRAM 3     /* 0 = off */
+#endif
+#ifndef WHISPER_DIVERSITY_WINDOW
+#define WHISPER_DIVERSITY_WINDOW 16
+#endif
+#ifndef WHISPER_DIVERSITY_UNIQ
+#define WHISPER_DIVERSITY_UNIQ 4      /* stop if last WINDOW generated tokens have <= this many unique */
+#endif
 #define WHISPER_MAX_ROW 4096     /* upper bound on `in` for a matvec (mlp hidden = 1536) */
 
 /* Coarse cycle profiling of the hot kernels (rdcycle; RV only). WHISPER_PROFILE=1 to enable. */
@@ -104,6 +129,7 @@ static wq8_t take_q8(cur_t *c, size_t out, size_t in, int gs) {
   w.q = (const int8_t *)c->p;         c->p += out * in;                 /* int8 values */
   w.s = (const float *)c->p;          c->p += (out * in / gs) * sizeof(float); /* group scales */
   w.qT = 0; w.sT = 0;                 /* K-major transpose built lazily (WHISPER_TILED) */
+  w.q4 = 0; w.s4 = 0;                 /* int4 repack built lazily (WHISPER_INT4) */
   return w;
 }
 
@@ -258,8 +284,23 @@ static void matvec_q8_i8(float *y, const float *x, const wq8_t *W, const float *
 }
 #endif /* WHISPER_INT8_ACT */
 
+#if WHISPER_INT4
+static void wq8_build_int4(wq8_t *W, int out, int in, int gs);   /* defined below */
+static void gemm_int4_row(float *out_row, const float *x, const int8_t *q4, const float *s4,
+                          const float *bias, int N, int K, int gs4, int o0, int o1);
+#endif
+
 static inline void matvec_q8(float *y, const float *x, const wq8_t *W, const float *bias,
                              int out, int in, int gs) {
+#if WHISPER_INT4
+  /* Decoder per-token projections (n=1, out>=384) are bandwidth-bound reductions like the classifier —
+   * int4 halves their weight DRAM stream. Built once, single-threaded (decode is not forked here). */
+  if (out >= WHISPER_INT4_MIN_OUT) {
+    wq8_build_int4((wq8_t *)W, out, in, gs);
+    gemm_int4_row(y, x, W->q4, W->s4, bias, out, in, WHISPER_INT4_GS, 0, out);
+    return;
+  }
+#endif
 #if WHISPER_INT8_ACT
   matvec_q8_i8(y, x, W, bias, out, in, gs);
 #elif WHISPER_USE_RVV
@@ -383,10 +424,133 @@ static void gemm_tiled_block(const mm_blk_t *b) {
 }
 #endif /* WHISPER_TILED */
 
+#if WHISPER_INT4
+/* Re-quantize a Q8_0 weight matrix to int4 [-7,7] (per WHISPER_INT4_GS K-group) in K-MAJOR SPLIT-HALF
+ * layout for the outer-product kernel. Per tap k the N outputs are packed nblk*16 bytes; within each
+ * 32-output block, byte i (i=0..15) holds output (b*32+i) in its low nibble and (b*32+16+i) in its high
+ * nibble — so a byte-vector load + two shifts yields two CONTIGUOUS output vectors (no deinterleave).
+ * s4[g*N + o] = per (K-group, output) scale. One-time, single-threaded (before any fork). */
+static void wq8_build_int4(wq8_t *W, int out, int in, int gs) {
+  if (W->q4) return;
+  const int gpr8 = in / gs;
+  const int g4n = WHISPER_INT4_GS, gpr4 = in / g4n;
+  const int nblk = (out + 31) / 32;
+  const size_t rowstride = (size_t)nblk * 16;               /* packed bytes per tap k */
+  int8_t *q4 = (int8_t *)xmalloc((size_t)in * rowstride);
+  float  *s4 = (float  *)xmalloc((size_t)gpr4 * out * sizeof(float));
+  memset(q4, 0, (size_t)in * rowstride);                     /* nibbles OR'd in; init 0 */
+  for (int o = 0; o < out; o++) {
+    const int8_t *qo = W->q + (size_t)o * in;
+    const float  *so = W->s + (size_t)o * gpr8;
+    const int blk = o / 32, local = o % 32;
+    const int byte_idx = (local < 16) ? local : (local - 16);
+    const int hi_nib = (local >= 16);
+    for (int g = 0; g < gpr4; g++) {
+      const int base = g * g4n;
+      float vmax = 0.0f;
+      for (int i = 0; i < g4n; i++) {
+        float v = (float)qo[base + i] * so[(base + i) / gs];
+        float a = v < 0 ? -v : v; if (a > vmax) vmax = a;
+      }
+      const float inv = (vmax > 0.0f) ? (7.0f / vmax) : 0.0f;
+      s4[(size_t)g * out + o] = vmax / 7.0f;
+      for (int i = 0; i < g4n; i++) {
+        const int k = base + i;
+        float v = (float)qo[k] * so[k / gs];
+        int nib = (int)lrintf(v * inv); if (nib > 7) nib = 7; else if (nib < -7) nib = -7;
+        int8_t *byte = &q4[(size_t)k * rowstride + (size_t)blk * 16 + byte_idx];
+        *byte |= (int8_t)(hi_nib ? ((nib & 0xF) << 4) : (nib & 0xF));
+      }
+    }
+  }
+  __sync_synchronize();
+  W->q4 = q4; W->s4 = s4;
+}
+
+/* int4 outer-product row: out_row[o] = bias[o] + sum_k x[k] * dequant(w[k][o]).  Silicon-safe (no
+ * reduction, m2, contiguous loads/stores). Processes output cols [o0,o1) (32-aligned) for one x row. */
+#ifndef WHISPER_INT4_SCALAR
+#define WHISPER_INT4_SCALAR 0   /* 1 = scalar int4 reference (packing check); 0 = RVV */
+#endif
+static void gemm_int4_row(float *out_row, const float *x, const int8_t *q4, const float *s4,
+                          const float *bias, int N, int K, int gs4, int o0, int o1) {
+  const int nblk = (N + 31) / 32;
+  const size_t rowstride = (size_t)nblk * 16;
+#if WHISPER_INT4_SCALAR
+  for (int blk = o0; blk < o1; blk += 32) {
+    int lo_n = N - blk;      if (lo_n > 16) lo_n = 16; else if (lo_n < 0) lo_n = 0;
+    int hi_n = N - blk - 16; if (hi_n > 16) hi_n = 16; else if (hi_n < 0) hi_n = 0;
+    for (int j = 0; j < lo_n; j++) out_row[blk + j]      = bias ? bias[blk + j] : 0.0f;
+    for (int j = 0; j < hi_n; j++) out_row[blk + 16 + j] = bias ? bias[blk + 16 + j] : 0.0f;
+    for (int k = 0; k < K; k++) {
+      const int g = k / gs4;
+      const int8_t *wb = q4 + (size_t)k * rowstride + (size_t)(blk / 32) * 16;
+      for (int j = 0; j < lo_n; j++) {
+        int lo = (int)(int8_t)(wb[j] << 4) >> 4;
+        out_row[blk + j] += x[k] * (float)lo * s4[(size_t)g * N + blk + j];
+      }
+      for (int j = 0; j < hi_n; j++) {
+        int hi = (int)wb[j] >> 4;
+        out_row[blk + 16 + j] += x[k] * (float)hi * s4[(size_t)g * N + blk + 16 + j];
+      }
+    }
+  }
+  return;
+#endif
+  /* Two f32m4 accumulators (lo/hi halves of each 32-output block). ~28/32 vector registers — fits
+   * without spilling (a combined single-accumulator variant using vslideup hit a vtype codegen fault
+   * on this toolchain, so this proven two-half form stays). i8m1 -> i16m2 -> i32m4 -> f32m4 chain. */
+  for (int blk = o0; blk < o1; blk += 32) {
+    int lo_n = N - blk;      if (lo_n > 16) lo_n = 16; else if (lo_n < 0) lo_n = 0;
+    int hi_n = N - blk - 16; if (hi_n > 16) hi_n = 16; else if (hi_n < 0) hi_n = 0;
+    const size_t vlo = __riscv_vsetvl_e32m4((size_t)lo_n);
+    const size_t vhi = hi_n > 0 ? __riscv_vsetvl_e32m4((size_t)hi_n) : 1;
+    vfloat32m4_t alo = __riscv_vfmv_v_f_f32m4(0.0f, vlo);
+    vfloat32m4_t ahi = __riscv_vfmv_v_f_f32m4(0.0f, vhi);
+    vfloat32m4_t slo = alo, shi = alo; int cg = -1;
+    const int bblk = blk / 32;
+    for (int k = 0; k < K; k++) {
+      const int g = k / gs4;
+      if (g != cg) {
+        slo = __riscv_vle32_v_f32m4(s4 + (size_t)g * N + blk, vlo);
+        if (hi_n > 0) shi = __riscv_vle32_v_f32m4(s4 + (size_t)g * N + blk + 16, vhi);
+        cg = g;
+      }
+      const int8_t *wb = q4 + (size_t)k * rowstride + (size_t)bblk * 16;
+      vint8m1_t v8 = __riscv_vle8_v_i8m1(wb, vlo);
+      vint8m1_t lo8 = __riscv_vsra_vx_i8m1(__riscv_vsll_vx_i8m1(v8, 4, vlo), 4, vlo);  /* sign-ext low nibble */
+      vfloat32m4_t lof = __riscv_vfcvt_f_x_v_f32m4(
+          __riscv_vwcvt_x_x_v_i32m4(__riscv_vwcvt_x_x_v_i16m2(lo8, vlo), vlo), vlo);
+      alo = __riscv_vfmacc_vf_f32m4(alo, x[k], __riscv_vfmul_vv_f32m4(lof, slo, vlo), vlo);
+      if (hi_n > 0) {
+        vint8m1_t hi8 = __riscv_vsra_vx_i8m1(v8, 4, vhi);                                /* sign-ext high nibble */
+        vfloat32m4_t hif = __riscv_vfcvt_f_x_v_f32m4(
+            __riscv_vwcvt_x_x_v_i32m4(__riscv_vwcvt_x_x_v_i16m2(hi8, vhi), vhi), vhi);
+        ahi = __riscv_vfmacc_vf_f32m4(ahi, x[k], __riscv_vfmul_vv_f32m4(hif, shi, vhi), vhi);
+      }
+    }
+    if (bias) {
+      alo = __riscv_vfadd_vv_f32m4(alo, __riscv_vle32_v_f32m4(bias + blk, vlo), vlo);
+      if (hi_n > 0) ahi = __riscv_vfadd_vv_f32m4(ahi, __riscv_vle32_v_f32m4(bias + blk + 16, vhi), vhi);
+    }
+    __riscv_vse32_v_f32m4(out_row + blk, alo, vlo);
+    if (hi_n > 0) __riscv_vse32_v_f32m4(out_row + blk + 16, ahi, vhi);
+  }
+}
+#endif /* WHISPER_INT4 */
+
 static void matmul_block(const mm_blk_t *b) {
   const int gpr = b->in / b->gs;
 #if WHISPER_TILED
   if (b->W->qT) { gemm_tiled_block(b); return; }
+#endif
+#if WHISPER_INT4
+  if (b->W->q4) {   /* int4 outer-product path (classifier), one x row at a time */
+    for (int r = b->r0; r < b->r1; r++)
+      gemm_int4_row(b->out_mat + (size_t)r * b->out, b->in_mat + (size_t)r * b->in,
+                    b->W->q4, b->W->s4, b->bias, b->out, b->in, WHISPER_INT4_GS, b->o0, b->o1);
+    return;
+  }
 #endif
 #if WHISPER_INT8_ACT
   int8_t xq[WHISPER_MAX_ROW];
@@ -445,12 +609,21 @@ static void matmul_q8(float *out_mat, const float *in_mat, const wq8_t *W, const
    * the reduction kernel. Build the K-major transpose here on hart 0, before any fork. */
   if (n >= WHISPER_TILE_MR) wq8_build_tiled((wq8_t *)W, out, in, gs);
 #endif
+#if WHISPER_INT4
+  /* The big non-tiled reduction matmul (classifier n=1, out=51864) is bandwidth-bound: repack to int4
+   * to halve its weight DRAM stream. Built once, on hart 0, before the fork. */
+  if (n < WHISPER_TILE_MR && out >= WHISPER_INT4_MIN_OUT) wq8_build_int4((wq8_t *)W, out, in, gs);
+#endif
 #if WHISPER_DUALCORE
   if ((long)n * out >= WHISPER_MM_MIN_WORK) {
     mm_blk_t h0 = { out_mat, in_mat, W, bias, out, in, gs, 0, n, 0, out };
     g_mm_h1 = h0;
     if (n >= 2) { int mid = n / 2;   h0.r1 = mid; g_mm_h1.r0 = mid; }  /* split rows */
-    else        { int mid = out / 2; h0.o1 = mid; g_mm_h1.o0 = mid; }  /* split columns (n==1) */
+    else        { int mid = out / 2;                                    /* split columns (n==1) */
+#if WHISPER_INT4
+                  if (W->q4) mid = (mid / 32) * 32;  /* int4 blocks are 32 outputs wide */
+#endif
+                  h0.o1 = mid; g_mm_h1.o0 = mid; }
 #if WHISPER_DUALCORE_DEBUG
     static int dbg_first = 1;
     if (dbg_first) printf("[whisper] dc matmul: n=%d out=%d in=%d -> issue hart1\n", n, out, in);
@@ -478,6 +651,14 @@ static void matmul_q8(float *out_mat, const float *in_mat, const wq8_t *W, const
   if (W->qT) {   /* transpose was built (many-row matmul) -> single-core tiled path */
     mm_blk_t b = { out_mat, in_mat, W, bias, out, in, gs, 0, n, 0, out };
     gemm_tiled_block(&b);
+    PROF_ADD(g_cyc_mm);
+    return;
+  }
+#endif
+#if WHISPER_INT4
+  if (W->q4) {   /* int4 built (big reduction matmul) -> single-core outer-product path */
+    for (int r = 0; r < n; r++)
+      gemm_int4_row(out_mat + (size_t)r * out, in_mat + (size_t)r * in, W->q4, W->s4, bias, out, in, WHISPER_INT4_GS, 0, out);
     PROF_ADD(g_cyc_mm);
     return;
   }
@@ -592,10 +773,6 @@ static void mha_run_heads(const float *q, const float *k, const float *v, int nq
                           int S, int n_head, int causal, float *out, int h0, int h1, float *sc) {
   const int hd = S / n_head;
   const float rscale = 1.0f / sqrtf((float)hd);
-#if WHISPER_USE_RVV && WHISPER_MHA_RVV
-  const int use_rvv = ((size_t)hd <= __riscv_vsetvlmax_e32m8());
-  const size_t vl = use_rvv ? __riscv_vsetvl_e32m8((size_t)hd) : 0;
-#endif
   for (int h = h0; h < h1; h++) {
     const int off = h * hd;
     for (int i = 0; i < nq; i++) {
@@ -603,65 +780,53 @@ static void mha_run_heads(const float *q, const float *k, const float *v, int nq
       const int lim = causal ? (i + 1) : nk;
       float mx = -1e30f;
 #if WHISPER_USE_RVV && WHISPER_MHA_RVV
-      if (use_rvv) {
-        /* transpose formulation: vectorize the scores over KEYS and accumulate across head_dim with
-         * vfmacc.vf (strided load of each head-dim column) — no per-key reduction. */
-        for (int j0 = 0; j0 < lim;) {
-          size_t vlk = __riscv_vsetvl_e32m8((size_t)(lim - j0));
-          vfloat32m8_t acc = __riscv_vfmv_v_f_f32m8(0.0f, vlk);
-          const float *kb = k + (size_t)j0 * S + off;         /* k[j0][off + 0] */
-          for (int d = 0; d < hd; d++)                        /* k[:,d] strided by S across keys */
-            acc = __riscv_vfmacc_vf_f32m8(acc, qi[d],
-                    __riscv_vlse32_v_f32m8(kb + d, (ptrdiff_t)S * sizeof(float), vlk), vlk);
-          __riscv_vse32_v_f32m8(sc + j0, __riscv_vfmul_vf_f32m8(acc, rscale, vlk), vlk);
-          j0 += (int)vlk;
-        }
-        for (int j = 0; j < lim; j++) if (sc[j] > mx) mx = sc[j];
-      } else
-#endif
-      {
-        for (int j = 0; j < lim; j++) {
-          const float *kj = k + (size_t)j * S + off;
-          float dot = 0.0f; for (int d = 0; d < hd; d++) dot += qi[d] * kj[d];
-          dot *= rscale; sc[j] = dot; if (dot > mx) mx = dot;
-        }
+      /* Scores: vectorize over KEYS, accumulate across head_dim with vfmacc (strided key-column loads —
+       * same idiom as conv1d_rvv, proven on silicon). NO reduction. m4 (not m8; m8 reductions hung). */
+      for (int j0 = 0; j0 < lim;) {
+        size_t vlk = __riscv_vsetvl_e32m4((size_t)(lim - j0));
+        vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vlk);
+        const float *kb = k + (size_t)j0 * S + off;
+        for (int d = 0; d < hd; d++)
+          acc = __riscv_vfmacc_vf_f32m4(acc, qi[d],
+                  __riscv_vlse32_v_f32m4(kb + d, (ptrdiff_t)S * sizeof(float), vlk), vlk);
+        __riscv_vse32_v_f32m4(sc + j0, __riscv_vfmul_vf_f32m4(acc, rscale, vlk), vlk);
+        j0 += (int)vlk;
       }
-      float sum = 0.0f;
-#if WHISPER_USE_RVV && WHISPER_MHA_RVV
-      {
-        const size_t vmax = __riscv_vsetvlmax_e32m8();
-        vfloat32m8_t vsum = __riscv_vfmv_v_f_f32m8(0.0f, vmax);
-        for (int j = 0; j < lim;) {
-          size_t vlx = __riscv_vsetvl_e32m8((size_t)(lim - j));
-          vfloat32m8_t e = exp_approx_m8(__riscv_vfsub_vf_f32m8(__riscv_vle32_v_f32m8(sc + j, vlx), mx, vlx), vlx);
-          __riscv_vse32_v_f32m8(sc + j, e, vlx);
-          vsum = __riscv_vfadd_vv_f32m8(vsum, e, vlx);
-          j += (int)vlx;
-        }
-        sum = __riscv_vfmv_f_s_f32m1_f32(
-            __riscv_vfredusum_vs_f32m8_f32m1(vsum, __riscv_vfmv_v_f_f32m1(0.0f, 1), vmax));
-      }
+      for (int j = 0; j < lim; j++) if (sc[j] > mx) mx = sc[j];
 #else
-      for (int j = 0; j < lim; j++) { float e = expf(sc[j] - mx); sc[j] = e; sum += e; }
+      for (int j = 0; j < lim; j++) {
+        const float *kj = k + (size_t)j * S + off;
+        float dot = 0.0f; for (int d = 0; d < hd; d++) dot += qi[d] * kj[d];
+        dot *= rscale; sc[j] = dot; if (dot > mx) mx = dot;
+      }
 #endif
-      float invs = 1.0f / sum;
+      /* Softmax: SCALAR (expf + scalar sum). The old vectorized sum used vfredusum, which hung on this
+       * silicon; the exp count is tiny (lim keys) so scalar costs nothing next to scores/output. */
+      float sum = 0.0f;
+      for (int j = 0; j < lim; j++) { float e = expf(sc[j] - mx); sc[j] = e; sum += e; }
+      const float invs = 1.0f / sum;
+
       float *oi = out + (size_t)i * S + off;
 #if WHISPER_USE_RVV && WHISPER_MHA_RVV
-      if (use_rvv) {
-        vfloat32m8_t ov = __riscv_vfmv_v_f_f32m8(0.0f, vl);
+      /* Output: vectorize over head_dim, accumulate over keys with vfmacc (contiguous v-row segments).
+       * NO reduction. m4 blocks (hd=64 -> two blocks). */
+      for (int d0 = 0; d0 < hd;) {
+        size_t vld = __riscv_vsetvl_e32m4((size_t)(hd - d0));
+        vfloat32m4_t ov = __riscv_vfmv_v_f_f32m4(0.0f, vld);
         for (int j = 0; j < lim; j++)
-          ov = __riscv_vfmacc_vf_f32m8(ov, sc[j] * invs, __riscv_vle32_v_f32m8(v + (size_t)j * S + off, vl), vl);
-        __riscv_vse32_v_f32m8(oi, ov, vl);
-      } else
-#endif
-      {
-        for (int d = 0; d < hd; d++) oi[d] = 0.0f;
-        for (int j = 0; j < lim; j++) {
-          float wj = sc[j] * invs;
-          const float *vj = v + (size_t)j * S + off;
-          for (int d = 0; d < hd; d++) oi[d] += wj * vj[d];
-        }
+          ov = __riscv_vfmacc_vf_f32m4(ov, sc[j] * invs,
+                  __riscv_vle32_v_f32m4(v + (size_t)j * S + off + d0, vld), vld);
+        __riscv_vse32_v_f32m4(oi + d0, ov, vld);
+        d0 += (int)vld;
       }
+#else
+      for (int d = 0; d < hd; d++) oi[d] = 0.0f;
+      for (int j = 0; j < lim; j++) {
+        float wj = sc[j] * invs;
+        const float *vj = v + (size_t)j * S + off;
+        for (int d = 0; d < hd; d++) oi[d] += wj * vj[d];
+      }
+#endif
     }
   }
 }
@@ -981,6 +1146,25 @@ int whisper_decode_greedy(const whisper_model_t *m, const float *enc_out, int n_
       layernorm(x, m->dec_ln_w, m->dec_ln_b, h, 1, S);
       /* tied classifier — route through matmul_q8 so it's dual-cored (n=1 -> column split) + profiled */
       matmul_q8(logits, h, &m->token_embedding, NULL, 1, m->n_vocab, S, m->gs);
+#if WHISPER_NO_REPEAT_NGRAM
+      /* no-repeat-ngram: ban any token that would recreate a previously-seen NG-gram whose first NG-1
+       * tokens match the current tail — kills repetition loops before they form. O(produced) scan. */
+      {
+        const int ng = WHISPER_NO_REPEAT_NGRAM;
+        if (produced >= ng - 1) {
+          for (int i = 0; i + ng <= produced; i++) {
+            int match = 1;
+            for (int t = 0; t < ng - 1; t++)
+              if (out_tokens[i + t] != out_tokens[produced - (ng - 1) + t]) { match = 0; break; }
+            if (match) logits[out_tokens[i + ng - 1]] = -1e30f;
+          }
+        }
+      }
+      /* Also ban a 3rd-consecutive identical token (kills "dumb dumb dumb" runs that the 3-gram guard
+       * only stops on the 4th) without over-banning legitimate bigram repeats. */
+      if (produced >= 2 && out_tokens[produced - 1] == out_tokens[produced - 2])
+        logits[out_tokens[produced - 1]] = -1e30f;
+#endif
       int best = 0; float bv = logits[0];
       for (int v = 1; v < m->n_vocab; v++) if (logits[v] > bv) { bv = logits[v]; best = v; }
       out_tokens[produced++] = best;
@@ -997,6 +1181,19 @@ int whisper_decode_greedy(const whisper_model_t *m, const float *enc_out, int n_
         if (match) { produced -= C; looped = 1; break; }
       }
       if (looped) break;
+#if WHISPER_DIVERSITY_WINDOW
+      /* Diversity backstop: a noisy near-loop (that no-repeat-ngram/exact-cycle miss) collapses the
+       * recent window to few unique tokens — stop and trim the low-diversity tail. */
+      if (produced >= WHISPER_DIVERSITY_WINDOW) {
+        int w0 = produced - WHISPER_DIVERSITY_WINDOW, uniq = 0;
+        for (int i = w0; i < produced; i++) {
+          int seen = 0;
+          for (int j = w0; j < i; j++) if (out_tokens[j] == out_tokens[i]) { seen = 1; break; }
+          if (!seen) uniq++;
+        }
+        if (uniq <= WHISPER_DIVERSITY_UNIQ) { produced = w0; break; }
+      }
+#endif
     }
   }
 

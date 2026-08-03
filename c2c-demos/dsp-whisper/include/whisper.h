@@ -14,7 +14,10 @@
  * scales. value(o,i) = q[o*in+i] * s[(o*in+i)/gs]. in is a multiple of gs so groups never cross a row.
  * qT/sT (built lazily under WHISPER_TILED) hold the K-major transpose used by the register-tiled GEMM:
  * qT[k*out + o] = q[o*in + k]; sT[g*out + o] = s[o*(in/gs) + g]. NULL until built. */
-typedef struct { const int8_t *q; const float *s; int8_t *qT; float *sT; } wq8_t;
+/* q4/s4 (built lazily under WHISPER_INT4) hold an int4 re-quantization of the weights, N-major, for the
+ * bandwidth-bound reduction path (classifier / decoder). q4 packs two signed nibbles [-7,7] per byte
+ * (row o = in/2 bytes); s4 has one fp32 scale per WHISPER_INT4_GS-element group. Halves weight DRAM. */
+typedef struct { const int8_t *q; const float *s; int8_t *qT; float *sT; int8_t *q4; float *s4; } wq8_t;
 
 typedef struct {
   const float *attn_ln_w, *attn_ln_b;

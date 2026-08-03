@@ -27,9 +27,16 @@ set_source_files_properties(src/model_data.S PROPERTIES
 # spins the trap handler). NOTE: keep this modest — uart_tsi uploads the whole segment MemSiz over
 # UART, zero-filling the heap, so an oversized heap makes flashing take *minutes*. 24 MiB is safe
 # headroom here; a full 30 s clip (3000 frames) would need ~48 MiB — raise it only for that.
+# Heap: derived-weight copies coexist on it — encoder K-major transpose (~7 MiB, WHISPER_TILED) + int4
+# classifier repack (~12 MiB, WHISPER_INT4) + ~8 MiB activation buffers. int4 needs ~40 MiB; without it
+# 24 MiB suffices. Bigger heap = more zero-fill uploaded over UART, so keep it only as large as needed.
+set(WHISPER_HEAP_SIZE 0x1800000)          # 24 MiB
+if(WHISPER_INT4)
+  set(WHISPER_HEAP_SIZE 0x2800000)        # 40 MiB
+endif()
 target_link_options(dsp-whisper PRIVATE
-  -Wl,--defsym=__heap_size=0x1800000    # 24 MiB (was 128 MiB -> cut ~104 MiB of zero-fill upload)
-  -Wl,--defsym=__stack_size=0x10000     # 64 KiB
+  -Wl,--defsym=__heap_size=${WHISPER_HEAP_SIZE}
+  -Wl,--defsym=__stack_size=0x10000       # 64 KiB
 )
 
 # Vectorize the hot matvec kernel with RISC-V V (VLEN=256). OFF = scalar reference oracle.
@@ -78,6 +85,24 @@ if(WHISPER_TILED)
   message(STATUS "dsp-whisper: WHISPER_TILED=1 (register-tiled GEMM)")
 endif()
 target_compile_definitions(dsp-whisper PRIVATE WHISPER_TILED=${WHISPER_TILED_VALUE})
+
+# RVV attention (strided-key scores + contiguous-v output, m4, scalar softmax — no vfredusum reduction).
+option(WHISPER_MHA_RVV "Vectorize attention (scores/output)" OFF)
+set(WHISPER_MHA_RVV_VALUE 0)
+if(WHISPER_MHA_RVV)
+  set(WHISPER_MHA_RVV_VALUE 1)
+  message(STATUS "dsp-whisper: WHISPER_MHA_RVV=1 (RVV attention)")
+endif()
+target_compile_definitions(dsp-whisper PRIVATE WHISPER_MHA_RVV=${WHISPER_MHA_RVV_VALUE})
+
+# int4 weights for the bandwidth-bound reduction path (classifier). Halves its weight DRAM stream.
+option(WHISPER_INT4 "int4 weights for the reduction/classifier path" OFF)
+set(WHISPER_INT4_VALUE 0)
+if(WHISPER_INT4)
+  set(WHISPER_INT4_VALUE 1)
+  message(STATUS "dsp-whisper: WHISPER_INT4=1 (int4 classifier weights)")
+endif()
+target_compile_definitions(dsp-whisper PRIVATE WHISPER_INT4=${WHISPER_INT4_VALUE})
 
 # Split the matmul across 2 harts (requires WHISPER_USE_RVV). Run under `spike -p2` / real 2-hart HW.
 option(WHISPER_DUALCORE "Split matmul across 2 harts" OFF)
