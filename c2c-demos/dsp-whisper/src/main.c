@@ -34,6 +34,37 @@ static inline uint64_t wf_rdcycle(void) {
   uint64_t c; __asm__ volatile("rdcycle %0" : "=r"(c)); return c;
 }
 
+/* One-shot DMA feasibility probe: time the core streaming a 32 KB weight-sized chunk from DRAM vs from
+ * the 64 KB on-chip SRAM (0x08000000) after DMA-ing it there. The DRAM/SRAM read-cycle RATIO is the gate
+ * for weight double-buffering — if SRAM reads aren't meaningfully faster, prefetching won't hide the
+ * DRAM-latency stalls and the (large) integration isn't worth it. Runs once at boot, then the normal demo. */
+#if DSP_WHISPER_DMA_PROBE
+#include "hal_dma.h"
+static void dma_feasibility_probe(void) {
+  enum { BYTES = 32u * 1024u, WORDS = BYTES / 4u, PKT = 64u };  /* PKT = 2^LOGW(6) */
+  const volatile uint32_t *dram = (const volatile uint32_t *)(whisper_model_blob + 4096);
+  volatile uint32_t *sram = (volatile uint32_t *)0x08000000u;
+  volatile uint32_t acc = 0;
+  uint64_t t0 = wf_rdcycle();
+  for (uint32_t i = 0; i < WORDS; i++) acc += dram[i];      /* streaming DRAM read */
+  uint64_t t1 = wf_rdcycle();
+  dma_transaction_t tx;
+  tx.core = 0; tx.transaction_id = 1; tx.transaction_priority = 1; tx.peripheral_id = 0;
+  tx.addr_r = (uint64_t)(uintptr_t)dram; tx.addr_w = (uint64_t)(uintptr_t)sram;
+  tx.inc_r = PKT; tx.inc_w = PKT; tx.len = (uint16_t)(BYTES / PKT); tx.logw = 6;
+  tx.do_interrupt = false; tx.do_address_gate = false;
+  uint64_t d0 = wf_rdcycle();
+  set_DMA_C(0, tx, true); start_DMA(0, tx.transaction_id, (void *)0); dma_wait_till_inactive(30); dma_reset();
+  uint64_t d1 = wf_rdcycle();
+  uint64_t t2 = wf_rdcycle();
+  for (uint32_t i = 0; i < WORDS; i++) acc += sram[i];      /* streaming SRAM read */
+  uint64_t t3 = wf_rdcycle();
+  DSP_WHISPER_LOG("[dma-probe] 32KB: dram_read=%lu sram_read=%lu dma_xfer=%lu  (sram is %lux faster; acc=%u)\n",
+                  (unsigned long)(t1 - t0), (unsigned long)(t3 - t2), (unsigned long)(d1 - d0),
+                  (unsigned long)((t1 - t0) / ((t3 - t2) ? (t3 - t2) : 1)), (unsigned)acc);
+}
+#endif
+
 static whisper_model_t g_model;
 static float g_mel[WF_N_MELS * DSP_WHISPER_MAX_FRAMES];
 static int   g_toks[DSP_WHISPER_MAX_TOKENS];
@@ -195,6 +226,10 @@ void app_init(void) {
    * it so a hang in secondary-hart bringup is visible. No-op unless built WHISPER_DUALCORE=1. */
   whisper_dualcore_init();
   DSP_WHISPER_LOG("[dsp-whisper] runtime up (hart 1 dispatched)\n");
+
+#if DSP_WHISPER_DMA_PROBE
+  dma_feasibility_probe();
+#endif
 
 #if DSP_WHISPER_USE_MIC
   config_I2S(DSP_WHISPER_MIC_CHANNEL, &g_i2s_params_mic);

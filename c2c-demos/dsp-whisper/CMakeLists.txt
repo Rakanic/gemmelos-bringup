@@ -95,6 +95,22 @@ if(WHISPER_MHA_RVV)
 endif()
 target_compile_definitions(dsp-whisper PRIVATE WHISPER_MHA_RVV=${WHISPER_MHA_RVV_VALUE})
 
+# Vocab pruning: classifier argmax over only the first N (~frequency-ordered) token ids + eot. 0 = full.
+set(WHISPER_VOCAB_TOPK "0" CACHE STRING "classifier top-K vocab subset (0 = full 51864)")
+target_compile_definitions(dsp-whisper PRIVATE WHISPER_VOCAB_TOPK=${WHISPER_VOCAB_TOPK})
+if(NOT WHISPER_VOCAB_TOPK STREQUAL "0")
+  message(STATUS "dsp-whisper: WHISPER_VOCAB_TOPK=${WHISPER_VOCAB_TOPK}")
+endif()
+
+# DMA weight double-buffering for the classifier: prefetch weight chunks DRAM->SRAM while computing.
+option(WHISPER_DMA_CLASSIFIER "DMA double-buffer the classifier weights" OFF)
+set(WHISPER_DMA_CLASSIFIER_VALUE 0)
+if(WHISPER_DMA_CLASSIFIER)
+  set(WHISPER_DMA_CLASSIFIER_VALUE 1)
+  message(STATUS "dsp-whisper: WHISPER_DMA_CLASSIFIER=1 (SRAM double-buffer)")
+endif()
+target_compile_definitions(dsp-whisper PRIVATE WHISPER_DMA_CLASSIFIER=${WHISPER_DMA_CLASSIFIER_VALUE})
+
 # int4 weights for the bandwidth-bound reduction path (classifier). Halves its weight DRAM stream.
 option(WHISPER_INT4 "int4 weights for the reduction/classifier path" OFF)
 set(WHISPER_INT4_VALUE 0)
@@ -122,6 +138,14 @@ target_compile_definitions(dsp-whisper PRIVATE WHISPER_DUALCORE_DEBUG=${WHISPER_
 
 # Run modes. FROM_AUDIO transcribes the embedded audio blob (Spike-testable); USE_MIC captures live
 # I2S audio (real silicon only, build PLATFORM=CHIP). Default = validate against the golden mel.
+# One-shot DMA SRAM-vs-DRAM read microbenchmark at boot (feasibility gate for weight double-buffering).
+option(DSP_WHISPER_DMA_PROBE "Boot-time DMA SRAM-vs-DRAM read probe" OFF)
+set(DSP_WHISPER_DMA_PROBE_VALUE 0)
+if(DSP_WHISPER_DMA_PROBE)
+  set(DSP_WHISPER_DMA_PROBE_VALUE 1)
+endif()
+target_compile_definitions(dsp-whisper PRIVATE DSP_WHISPER_DMA_PROBE=${DSP_WHISPER_DMA_PROBE_VALUE})
+
 option(DSP_WHISPER_FROM_AUDIO "Transcribe the embedded audio blob" OFF)
 option(DSP_WHISPER_USE_MIC "Capture + transcribe live I2S mic audio (CHIP only)" OFF)
 set(DSP_WHISPER_FROM_AUDIO_VALUE 0)

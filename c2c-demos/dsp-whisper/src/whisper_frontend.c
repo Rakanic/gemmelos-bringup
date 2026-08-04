@@ -191,11 +191,22 @@ static void fe_worker(void *a) {
 }
 #endif
 
+/* Minimum mel frames fed to the encoder. Whisper is trained on 30 s (3000 frames) zero-padded, so an
+ * ultra-short clip (e.g. 34 frames) is badly out-of-distribution and the decoder hallucinates repeats.
+ * Zero-padding the mel up to a moderate floor stabilizes short utterances while keeping the encoder
+ * bounded (~64 positions, not 1500). Real frames are computed from audio; the pad frames are silence. */
+#ifndef WHISPER_FE_MIN_FRAMES
+#define WHISPER_FE_MIN_FRAMES 160   /* ~80 enc positions: enough context to stop short-clip hallucination */
+#endif
+
 int whisper_logmel_full(const float *audio, int n_samples, float *out_mel, int max_frames) {
   const int P = WF_N_FFT / 2;                       /* center pad = 200 */
-  int n_frames = n_samples / WF_HOP;                /* whisper: floor(n/hop), after dropping last */
+  int n_real = n_samples / WF_HOP;                  /* whisper: floor(n/hop), after dropping last */
+  if (n_real > max_frames) n_real = max_frames;
+  if (n_real <= 0) return 0;
+  int n_frames = n_real;                            /* stride of the (possibly padded) output */
+  if (n_frames < WHISPER_FE_MIN_FRAMES) n_frames = WHISPER_FE_MIN_FRAMES;
   if (n_frames > max_frames) n_frames = max_frames;
-  if (n_frames <= 0) return 0;
 
   FE_DBG("[frontend] logmel_full: n_samples=%d n_frames=%d P=%d\n", n_samples, n_frames, P);
   /* Build the reflect-padded signal (torch.stft center=True, pad_mode='reflect'). */
@@ -208,15 +219,16 @@ int whisper_logmel_full(const float *audio, int n_samples, float *out_mel, int m
     pad[P + n_samples + i] = audio[(src >= 0) ? src : 0];
   }
 
-  /* Per-frame raw log-mel (coeff-major) + track the global max for whisper's normalization. */
+  /* Per-frame raw log-mel (coeff-major, stride n_frames) over the REAL frames [0,n_real); track gmax
+   * for whisper's normalization (real frames only — pad frames must not lift the max). */
   float gmax = -1e30f;
-  FE_DBG("[frontend] pad filled, starting %d DFT frames...\n", n_frames);
+  FE_DBG("[frontend] pad filled, starting %d DFT frames (out stride %d)...\n", n_real, n_frames);
 #if WHISPER_DUALCORE
-  if (n_frames >= 4) {
-    const int mid = n_frames / 2;
-    g_fe_h1 = (fe_blk_t){ pad, out_mel, n_frames, mid, n_frames, -1e30f };
+  if (n_real >= 4) {
+    const int mid = n_real / 2;
+    g_fe_h1 = (fe_blk_t){ pad, out_mel, n_frames, mid, n_real, -1e30f };
     __asm__ volatile("fence rw, rw" ::: "memory");
-    hthread_issue(1, fe_worker, &g_fe_h1);                              /* hart 1: frames [mid,n) */
+    hthread_issue(1, fe_worker, &g_fe_h1);                              /* hart 1: frames [mid,n_real) */
     float gmax0 = logmel_frame_range(pad, out_mel, n_frames, 0, mid);  /* hart 0: frames [0,mid) */
     hthread_join(1);
     __asm__ volatile("fence rw, rw" ::: "memory");
@@ -224,10 +236,15 @@ int whisper_logmel_full(const float *audio, int n_samples, float *out_mel, int m
   } else
 #endif
   {
-    gmax = logmel_frame_range(pad, out_mel, n_frames, 0, n_frames);
+    gmax = logmel_frame_range(pad, out_mel, n_frames, 0, n_real);
   }
-  FE_DBG("[frontend] all frames done, normalizing\n");
   free(pad);
+
+  /* Zero-pad (silence) the frames [n_real, n_frames): set a very-negative raw value so the normalization
+   * below clamps them to the floor — exactly what a run of silent mel frames produces in whisper. */
+  for (int f = n_real; f < n_frames; f++)
+    for (int m = 0; m < WF_N_MELS; m++) out_mel[(size_t)m * n_frames + f] = -1e30f;
+  FE_DBG("[frontend] all frames done (real=%d pad_to=%d), normalizing\n", n_real, n_frames);
 
   /* Normalize: log_spec = max(log_spec, gmax-8); (log_spec + 4) / 4. */
   const float floorv = gmax - 8.0f;

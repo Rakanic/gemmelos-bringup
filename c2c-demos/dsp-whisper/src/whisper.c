@@ -81,11 +81,40 @@
 #ifndef WHISPER_INT4_MIN_OUT
 #define WHISPER_INT4_MIN_OUT 384 /* only repack matmuls whose output dim >= this */
 #endif
-/* Anti-loop for greedy decode on marginal/non-speech audio (no eot). no-repeat-ngram bans any token
- * that would recreate a previously-seen N-gram (prevents the loop forming); the diversity cutoff is a
- * backstop that stops when the recent window collapses to few unique tokens. */
+/* int4 on the decoder per-token matvecs: OFF — degrades decode quality (see matvec_q8). The classifier
+ * int4 (via matmul_q8, WHISPER_INT4) stays on; only the hidden-state projections revert to int8. */
+#ifndef WHISPER_INT4_DECODER
+#define WHISPER_INT4_DECODER 0
+#endif
+/* DMA weight double-buffering for the classifier (the biggest DRAM weight stream, 20 MB int8/token).
+ * Prefetch weight-row chunks DRAM->SRAM (0x08000000) via the DMA engine while the core computes the dot
+ * products from the previous chunk in SRAM (~4x faster core reads; DMA ~30x faster than core-DRAM so it
+ * never starves). Single-core (SRAM-fast beats dual-core-DRAM-slow). Requires WHISPER_INT4=0 (int8). */
+#ifndef WHISPER_DMA_CLASSIFIER
+#define WHISPER_DMA_CLASSIFIER 0
+#endif
+#ifndef WHISPER_DMA_SRAM_BASE
+#define WHISPER_DMA_SRAM_BASE 0x08000000UL   /* 64 KiB on-chip SCRATCH (dsp25.ld) */
+#endif
+#ifndef WHISPER_DMA_CHUNK_ROWS
+#define WHISPER_DMA_CHUNK_ROWS 64u           /* rows/chunk: 64*384 = 24 KiB; two buffers = 48 KiB < 64 */
+#endif
+/* Anti-loop for greedy decode on short/marginal audio (no eot). NOTE: no-repeat-ngram is OFF — it
+ * BACKFIRED: banning an exact repeat forces the model onto a near-repeat ("fellow"->"fella") that the
+ * exact-cycle guard can no longer catch, so it runs longer. Better to let clean exact repeats happen
+ * and be trimmed by the cycle guard, and to stop at the first sentence-final punctuation (one command =
+ * one sentence), which cuts the hallucinated phrase-repeat that follows a short utterance. */
 #ifndef WHISPER_NO_REPEAT_NGRAM
-#define WHISPER_NO_REPEAT_NGRAM 3     /* 0 = off */
+#define WHISPER_NO_REPEAT_NGRAM 0     /* 0 = off (see note) */
+#endif
+#ifndef WHISPER_STOP_AT_SENTENCE_END
+#define WHISPER_STOP_AT_SENTENCE_END 1  /* stop after the first . ! ? — one utterance = one sentence */
+#endif
+/* Vocab pruning: compute the classifier over only the first TOPK token ids (+ eot). GPT-2 BPE ids are
+ * ~frequency-ordered, so [0,TOPK) is the common-English subset; byte-level BPE can still spell excluded
+ * words from in-subset pieces. Cuts the classifier weight stream ~n_vocab/TOPK x. 0 = off (full vocab). */
+#ifndef WHISPER_VOCAB_TOPK
+#define WHISPER_VOCAB_TOPK 0
 #endif
 #ifndef WHISPER_DIVERSITY_WINDOW
 #define WHISPER_DIVERSITY_WINDOW 16
@@ -292,9 +321,11 @@ static void gemm_int4_row(float *out_row, const float *x, const int8_t *q4, cons
 
 static inline void matvec_q8(float *y, const float *x, const wq8_t *W, const float *bias,
                              int out, int in, int gs) {
-#if WHISPER_INT4
-  /* Decoder per-token projections (n=1, out>=384) are bandwidth-bound reductions like the classifier —
-   * int4 halves their weight DRAM stream. Built once, single-threaded (decode is not forked here). */
+#if WHISPER_INT4 && WHISPER_INT4_DECODER
+  /* int4 on the DECODER per-token projections. DISABLED by default: unlike the classifier (whose int4
+   * only affects a robust argmax), int4 noise in the decoder *hidden states* degrades decode quality —
+   * it turned an exact repeat (caught by the cycle guard) into a word-varying near-repeat the guards
+   * miss (FROM_AUDIO went 6 -> 23 tokens). The per-token speed saved isn't worth the extra tokens. */
   if (out >= WHISPER_INT4_MIN_OUT) {
     wq8_build_int4((wq8_t *)W, out, in, gs);
     gemm_int4_row(y, x, W->q4, W->s4, bias, out, in, WHISPER_INT4_GS, 0, out);
@@ -597,11 +628,85 @@ void whisper_dualcore_init(void) {
 void whisper_dualcore_init(void) {}   /* stub when there is no second hart */
 #endif
 
+#if WHISPER_DMA_CLASSIFIER
+#include "hal_dma.h"
+extern float whisper_matrow_q8(const int8_t *q, const float *x, const float *s, int in, int gs);
+static uint16_t g_dma_tid = 1;
+/* Start an async DMA of `bytes` (a multiple of 64) from DRAM `src` to SRAM `dst` on channel 0. */
+static void dma_chunk_start(void *dst, const void *src, uint32_t bytes) {
+  dma_transaction_t tx;
+  tx.core = 0; tx.transaction_id = g_dma_tid; tx.transaction_priority = 1; tx.peripheral_id = 0;
+  tx.addr_r = (uint64_t)(uintptr_t)src; tx.addr_w = (uint64_t)(uintptr_t)dst;
+  tx.inc_r = 64; tx.inc_w = 64; tx.len = (uint16_t)(bytes / 64u); tx.logw = 6;
+  tx.do_interrupt = false; tx.do_address_gate = false;
+  set_DMA_C(0, tx, true);
+  start_DMA(0, g_dma_tid, (void *)0);
+}
+static void dma_chunk_finish(void) {
+  dma_wait_till_inactive(30);
+  dma_reset();
+  __asm__ volatile("fence rw, rw" ::: "memory");   /* order DMA completion before the core reads SRAM */
+  g_dma_tid++;
+}
+
+/* Invalidate the cache line containing `p` (cbo.inval — discard, no writeback). Emitted as a raw insn
+ * since the toolchain march lacks zicbom. The SRAM buffers are only ever DMA-written, never core-written,
+ * so the cached copies are clean; invalidating forces the core to refetch the freshly-DMA'd data. */
+static inline void cbo_inval(const void *p) {
+  __asm__ volatile(".insn i 0x0f, 2, x0, 0(%0)" :: "r"(p) : "memory");
+}
+static void sram_inval(const int8_t *buf, uint32_t bytes) {
+  for (uint32_t i = 0; i < bytes; i += 64u) cbo_inval(buf + i);
+  __asm__ volatile("fence rw, rw" ::: "memory");
+}
+
+/* Classifier via DMA weight double-buffering: stream token_embedding rows through two SRAM ping-pong
+ * buffers while the core computes each row's dot from SRAM. Single-core, int8. */
+static void classifier_dma(float *logits, const float *h, const wq8_t *W, int out, int in, int gs) {
+  const int gpr = in / gs;
+  const uint32_t R = WHISPER_DMA_CHUNK_ROWS;
+  const uint32_t CHUNK = R * (uint32_t)in;                 /* bytes/chunk (multiple of 64: in=384=6*64) */
+  int8_t *buf[2];
+  buf[0] = (int8_t *)WHISPER_DMA_SRAM_BASE;
+  buf[1] = buf[0] + CHUNK;
+  const int8_t *q = W->q;
+  const int nchunks = (out + (int)R - 1) / (int)R;
+  const uint32_t rows0 = (uint32_t)((out < (int)R) ? out : (int)R);
+  dma_chunk_start(buf[0], q, rows0 * (uint32_t)in);        /* prime chunk 0 */
+  dma_chunk_finish();
+  for (int c = 0; c < nchunks; c++) {
+    int8_t *cur = buf[c & 1], *nxt = buf[(c + 1) & 1];
+    const int r0 = c * (int)R, rc = (out - r0 < (int)R) ? (out - r0) : (int)R;
+    const int has_next = (c + 1 < nchunks);
+    if (has_next) {                                        /* prefetch chunk c+1 while we compute chunk c */
+      const int rn0 = (c + 1) * (int)R;
+      const uint32_t rn = (uint32_t)((out - rn0 < (int)R) ? (out - rn0) : (int)R);
+      dma_chunk_start(nxt, q + (size_t)rn0 * in, rn * (uint32_t)in);
+    }
+    sram_inval(cur, (uint32_t)rc * (uint32_t)in);          /* discard stale cache; read the fresh DMA'd chunk */
+    for (int r = 0; r < rc; r++) {
+      const int o = r0 + r;
+      logits[o] = whisper_matrow_q8(cur + (size_t)r * in, h, W->s + (size_t)o * gpr, in, gs);
+    }
+    if (has_next) dma_chunk_finish();
+  }
+}
+#endif /* WHISPER_DMA_CLASSIFIER */
+
 /* matmul: n input rows x out outputs. Single-core (dispatcher per row), or — under WHISPER_DUALCORE
  * — split across 2 harts for large matmuls (by rows when n>=2, else output columns). */
 static void matmul_q8(float *out_mat, const float *in_mat, const wq8_t *W, const float *bias,
                       int n, int out, int in, int gs) {
   PROF_T0();
+#if WHISPER_DMA_CLASSIFIER
+  /* The classifier is the only n==1, huge-out matmul; stream its weights through SRAM (double-buffered)
+   * instead of the dual-core DRAM reduction. bias is NULL for the tied classifier. */
+  if (n == 1 && out >= 4096) {
+    classifier_dma(out_mat, in_mat, W, out, in, gs);
+    PROF_ADD(g_cyc_mm);
+    return;
+  }
+#endif
 #if WHISPER_TILED
   /* Tile only many-row matmuls (encoder / cross-KV, n=100): the register tiling reuses each weight
    * vector across MR rows, so a single-row matmul (classifier n=1, decoder per-token) gains nothing
@@ -1145,7 +1250,19 @@ int whisper_decode_greedy(const whisper_model_t *m, const float *enc_out, int n_
     if (pos >= sot_len - 1) {
       layernorm(x, m->dec_ln_w, m->dec_ln_b, h, 1, S);
       /* tied classifier — route through matmul_q8 so it's dual-cored (n=1 -> column split) + profiled */
+#if WHISPER_VOCAB_TOPK
+      const int topk = (WHISPER_VOCAB_TOPK < m->n_vocab) ? WHISPER_VOCAB_TOPK : m->n_vocab;
+      matmul_q8(logits, h, &m->token_embedding, NULL, 1, topk, S, m->gs);   /* only the common [0,topk) */
+      if (eot >= topk) {   /* eot lives above topk -> compute its single logit so decode can still stop */
+        wq8_t we; we.q = m->token_embedding.q + (size_t)eot * S;
+        we.s = m->token_embedding.s + (size_t)eot * (S / m->gs);
+        we.qT = 0; we.sT = 0; we.q4 = 0; we.s4 = 0;
+        matvec_q8(&logits[eot], h, &we, NULL, 1, S, m->gs);
+      }
+#else
+      const int topk = m->n_vocab;
       matmul_q8(logits, h, &m->token_embedding, NULL, 1, m->n_vocab, S, m->gs);
+#endif
 #if WHISPER_NO_REPEAT_NGRAM
       /* no-repeat-ngram: ban any token that would recreate a previously-seen NG-gram whose first NG-1
        * tokens match the current tail — kills repetition loops before they form. O(produced) scan. */
@@ -1160,17 +1277,32 @@ int whisper_decode_greedy(const whisper_model_t *m, const float *enc_out, int n_
           }
         }
       }
-      /* Also ban a 3rd-consecutive identical token (kills "dumb dumb dumb" runs that the 3-gram guard
-       * only stops on the 4th) without over-banning legitimate bigram repeats. */
+#endif
+      /* Ban a 3rd-consecutive identical token ("feel feel feel") — always on, independent of the
+       * (off) no-repeat-ngram. A word repeated 3x in a row is never legitimate speech; two is allowed. */
       if (produced >= 2 && out_tokens[produced - 1] == out_tokens[produced - 2])
         logits[out_tokens[produced - 1]] = -1e30f;
-#endif
       int best = 0; float bv = logits[0];
-      for (int v = 1; v < m->n_vocab; v++) if (logits[v] > bv) { bv = logits[v]; best = v; }
+      for (int v = 1; v < topk; v++) if (logits[v] > bv) { bv = logits[v]; best = v; }
+#if WHISPER_VOCAB_TOPK
+      if (eot >= topk && logits[eot] > bv) { bv = logits[eot]; best = eot; }   /* eot considered too */
+#endif
       out_tokens[produced++] = best;
       WDBG("[whisper] decode pos=%d -> tok=%d (logit=%d)\n", pos, best, (int)bv);
       if (best == eot || produced >= max_new) break;
       if (pos + 1 < maxL) tokens[pos + 1] = best;
+#if WHISPER_STOP_AT_SENTENCE_END
+      /* One command = one sentence: stop at the first sentence-final punctuation, before the short-clip
+       * hallucinated phrase-repeat begins ("Good morning." then a spurious "Good morning"). */
+      if (best < WV_EOT) {
+        int se = 0;
+        for (int b = wv_offset[best]; b < wv_offset[best + 1]; b++) {
+          unsigned char c = wv_bytes[b];
+          if (c == '.' || c == '!' || c == '?') { se = 1; break; }
+        }
+        if (se) break;
+      }
+#endif
       /* Repetition guard: truncated / low-SNR audio makes greedy decode loop (it never emits eot).
        * If the last C tokens duplicate the preceding C, we're in a cycle — drop the repeat and stop. */
       int looped = 0;
