@@ -44,6 +44,19 @@ checktsi:
 tsi-run:
 	uart_tsi +tty=$(TTY) +baudrate=921600 $(BINARY)
 
+# Run a scratchpad-linked binary (built with LINKER=scratch, i.e. everything at 0x08000000).
+# The bootrom jumps to whatever address the boot-address register holds (default 0x80000000 =
+# DRAM), so we reprogram it first. uart_tsi applies +init_write AFTER loading the program and
+# just BEFORE releasing hart 0's MSIP, so the new vector is in place when the core starts.
+# BOOTADDR_REG lives at 0x1000 (PBUS); it is XLen-wide but its upper word is already 0, and
+# +init_write is a 32-bit store, so writing the low word is enough.
+BOOTADDR_REG ?= 0x1000
+BOOTADDR     ?= 0x08000000
+
+.PHONY: tsi-run-spad
+tsi-run-spad:
+	uart_tsi +tty=$(TTY) +baudrate=921600 +init_write=$(BOOTADDR_REG):$(BOOTADDR) $(BINARY)
+
 .PHONY: vcs-run
 vcs-run:
 	echo "Running VCS tests within $(CY_DIR)"

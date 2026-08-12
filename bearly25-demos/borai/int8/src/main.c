@@ -86,7 +86,9 @@ const unsigned char *ASCII_BEL = (const unsigned char *) "\a";
 // int32_t GS = 64; // group size global for quantization of the weights
 
 #ifndef KWS_LLAMA_COMBINED
-uint64_t target_frequency = 1000000000l;
+uint64_t target_frequency = 750000000l;   /* 750 MHz: 1 GHz didn't lock on dsp25 silicon (hung at
+                                           * init_test). The combined KWS+Llama demo supplies its own
+                                           * frequency, which is why boraiq only hung standalone. */
 #endif
 
 // #ifdef ENABLE_DMA_MATVEC
