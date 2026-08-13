@@ -370,6 +370,48 @@ Software defects to fix later (distinct from the hardware quirks below).
   `ref_stage_sums` to find the diverging layer). See "KWS accuracy / TinySpeech".
 - **Status:** worked-around (float); int8 fix deferred.
 
+### [DSP 25 / LINKER=llm] `dsp25-llm.ld` puts the stack ~1.9 GB PAST the end of real DRAM  (discovered 2026-08-12, measured on silicon)
+- **Symptom:** three different stack sizes, three different failure modes, same source:
+  | `__stack_start` | `__stack_size` | behaviour on silicon |
+  |---|---|---|
+  | `0xFFFFB000` | 4 KiB (default) | frames run off the bottom; stores do not stick -> **silent, intermittent corruption** |
+  | `0xFFFB0000` | 64 KiB | works, but reads below ~`0xFFFB3900` return non-pattern garbage |
+  | `0xFFEC0000` | 256 KiB | **writing there hangs the core outright** (no trap, no print) |
+- **Cause:** `dsp25-llm.ld` declares `DRAM` as **2048M** so a large `.incbin`'d model fits inside
+  medany's ±2 GiB PC-relative range, then derives the stack from the region END
+  (`__stack_start = ORIGIN + LENGTH - 5*__stack_size`, i.e. just under `0x1_0000_0000`). The chip's
+  DRAM actually ends at `0x8FFF_FFFF` (stock `dsp25.ld` says 256M). The stack therefore lands in a
+  narrow, undocumented band near the top of the 32-bit space that is only PARTIALLY backed — and
+  *growing* the stack walks off the bottom of that band into address space that hangs on write.
+- **Rule:** with `LINKER=llm`, **pin the stack into real DRAM** rather than inheriting it from the
+  fictitious region end. The symbols are `PROVIDE()`d, so `--defsym` overrides them:
+  ```
+  -Wl,--defsym=__stack_size=0x40000
+  -Wl,--defsym=__stack_start=0x8FE00000   # + 5 harts * 256 KiB = 0x8FF40000, under the 0x90000000 top
+  -Wl,--defsym=__heap_end=0x8FE00000      # so sbrk cannot grow the heap into the stacks
+  ```
+  See `c2c-demos/dsp-citrinet/CMakeLists.txt` for the worked example.
+- **Still exposed:** `dsp-moonshine`, `dsp-whisper` and the tinyllama target all use `LINKER=llm`
+  with 64 KiB stacks in that fragile window. They work today; they are one stack-size change away
+  from not working.
+- **Status:** fixed in `dsp-citrinet`; open elsewhere.
+
+### (RESOLVED, but read this before porting a demo) A stack overflow on this platform is SILENT and looks exactly like a flaky chip
+- **Where:** `c2c-demos/dsp-citrinet` — hit 2026-08-12; see `.claude/plans/007-citrinet-dsp.md`.
+- **Issue:** `dsp-citrinet/CMakeLists.txt` never set `__stack_size`, inheriting the linker default of
+  **4 KiB**, while `cn_run_validate` had an **18,800-byte frame** (it held a 17,272-byte `cn_model_t`
+  as a local). Same ELF, different result every silicon run.
+- **Why it hides:** with `LINKER=llm` the stack sits at the top of a declared-2 GiB DRAM region, so an
+  overflow runs off the bottom into address space the SoC does not back — **stores stop reading back
+  instead of faulting**. Only AUTOMATICS go wrong; register-held values stay correct, so a function
+  can compute a correct checksum over bytes it simultaneously parses into garbage. Spike maps real
+  zeroed RAM across that whole range, so the same overflow passes in simulation forever.
+- **Rule:** every demo using `LINKER=llm` must set `-Wl,--defsym=__stack_size=0x10000` (as
+  `dsp-moonshine` and `dsp-whisper` do), keep multi-KB objects `static` rather than automatic, and
+  build with `-Wstack-usage=`. `dsp-citrinet` now paints its stack at boot and prints the high-water
+  mark (`cn_stack_paint`/`cn_stack_report`) — copy that into any new demo on this platform.
+- **Status:** fixed.
+
 ### (RESOLVED) Consumer read path write-then-flush
 - The turn-taking rewrite (plan 002) replaced the old `refresh_shared`/`poll_next_frame` path. BML
   now reads its own spad via `c2c_local_read_block_verify` (full flush, then read, then FNV checksum,
