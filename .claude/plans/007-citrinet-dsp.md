@@ -495,3 +495,197 @@ for the depthwise**, which is 2% of the MACs and 25% of the instructions. Candid
   reduction-and-vtype-churn problem that made moonshine's int4 kernel slower than int8.
 - Then the depthwise conv (also contiguous in `t`).
 - Mic mode on silicon (`-DDSP_CITRINET_USE_MIC=ON`), reusing the proven VAD capture.
+
+## 13. Live mic input (built 2026-08-12, pending silicon)
+
+The VAD capture in `main.c` is a straight port of `dsp-moonshine`'s, which is itself the proven
+`dsp-whisper` / `dsp-kws-rolling` path — same I2S params (`clkdiv=8`, `ws_len=3`, 32-bit slots),
+same 24-bit-in-32 extraction (`>>8`, /2^23), same onset gate + pre-roll + end-detect + DC removal.
+Nothing model-specific changed, because Citrinet consumes exactly what Moonshine does: mono float
+@16 kHz. The mic is clocked at 16 kHz directly, so there is no resampling step.
+
+Build (best config + mic):
+
+```
+make build CHIP=dsp25 PLATFORM=CHIP TARGET=dsp-citrinet \
+  EXTRA_CMAKE_ARGS="-DLINKER=llm -DDSP_CITRINET_USE_MIC=ON -DCITRINET_USE_RVV=ON \
+                    -DCITRINET_CONV1D=OFF -DCITRINET_PROFILE=OFF"
+```
+
+`CITRINET_CONV1D=OFF` and `CITRINET_PROFILE=OFF` are spelled out because CMake **caches** options
+and the last experiment left `CONV1D=ON` in the cache — that is the hanging build, and it would be
+inherited silently by any later configure that does not override it.
+
+Two things this mode changes about the demo's failure surface, both handled:
+
+- **Variable-length audio.** The embedded blob is always 3 s / 301 frames; a live capture is
+  anywhere from ~3.5 k to 51.2 k samples. `cn_logmel` guards `T <= 1` (`citrinet.c:644`) *before*
+  any allocation, so the ddof=1 normalization at line 697 cannot divide by zero and a too-short
+  capture returns an empty transcript and loops instead of faulting. Worst case out of the VAD
+  (instant silence after onset, then the hangover trim) is ~3,520 samples -> ~21 mel frames ->
+  ~3 encoder frames, which is well inside that guard.
+- **No golden to check against.** Mic mode cannot validate, so `report_audio_checksum()` is
+  `#if !DSP_CITRINET_USE_MIC` and the correctness oracle is the printed transcript. The stack
+  paint/report pair still runs every utterance — keep watching the high-water line, since it is the
+  only remaining detector for the class of bug that made this port non-reproducible.
+
+Sizing: `g_mic_audio` (204.8 KB) + `g_vad_ring` (12.8 KB) put .bss at 262 KB; the heap still has
+~242 MB below `__heap_end = 0x8FE00000`. Latency should track the embedded-blob number (~4.2 s for
+3 s of audio), since the encoder cost is a fixed function of audio length.
+
+**VAD tuning knobs**, if the room is noisy or it triggers on silence:
+`DSP_CITRINET_VAD_THRESHOLD` (1.5e-3, onset), `DSP_CITRINET_VAD_END_THRESHOLD`,
+`DSP_CITRINET_VAD_TAIL_MS`, `DSP_CITRINET_VAD_HANGOVER_FRAMES` (40 = ~800 ms).
+The per-frame `energy=N/1e6` log lines (every 25 frames) are what you tune from.
+
+### End-of-speech tail (changed 2026-08-12, after first silicon run)
+
+First silicon run worked but clipped the end of the last word. The cause was the trim, not the
+detector: the capture loop always runs `HANGOVER_FRAMES` (~800 ms) past the end of speech — that is
+how it knows speech ended — and the old trim gave back **all but one 20 ms frame** of that run
+(`trim = (silence - 1) * FR`). So the recording ended at the instant energy dropped, and any quiet
+word ending fell outside it.
+
+Two coupled changes, and the coupling is the point:
+
+- `DSP_CITRINET_VAD_END_THRESHOLD` **8.0e-4 -> 1.2e-3.** Raising it makes the detector fire SOONER
+  (more frames read as silence). Alone, that would clip *more*.
+- `DSP_CITRINET_VAD_TAIL_MS` = **300** (new). The trim is now `(silence - TAIL_FRAMES) * FR`, so
+  the kept audio extends 300 ms past the point energy first dropped.
+
+The tail is what pays for the higher threshold. Unvoiced word endings ("s", "th", "f") sit well
+below a voiced vowel, so a higher END_THRESHOLD counts them as silence — but they now land *inside*
+the kept 300 ms run rather than after it. Raise the threshold further only alongside a longer tail.
+Kept below the onset threshold on purpose (hysteresis): a frame loud enough to start a capture
+should not be quiet enough to end one.
+
+`_Static_assert` enforces `TAIL_FRAMES <= HANGOVER_FRAMES` — the capture never records further than
+the hangover past speech, so a longer tail would be silently truncated rather than honored. The
+capture log now prints `tail=N ms`, and flags `buffer full — speech may be cut` when the run hit the
+51.2 k sample ceiling before the hangover elapsed (that is a genuinely truncated utterance, and a
+different problem from the trim).
+
+Note `dsp-moonshine` and `dsp-whisper` still have the original `silence - 1` trim and the 8.0e-4
+threshold; port this over if they clip too.
+
+### Two-microphone array (built 2026-08-12, `-DDSP_CITRINET_MIC_STEREO=ON`, pending silicon)
+
+**Both mics go on ONE channel's L/R slots, NOT on two channels.** This is the whole design decision.
+Each I2S channel owns a clock generator (`clkgen_en` + its own `I2S_CLKDIV(channel)`), so two
+channels are two independently-generated, drifting time bases. Every useful two-mic operation — sum,
+difference, beamforming — depends on a stable sample-to-sample phase relationship between the mics,
+and independent clocks destroy precisely that. Two mics sharing one BCLK/WS are sample-locked by
+construction. The HAL already exposes this: `I2S_RX_L(ch)` @ `0x60+0x10*ch` and `I2S_RX_R(ch)` @
+`0x68+0x10*ch` are separate FIFOs on the same channel, selected by `read_I2S_rx(ch, side)`.
+
+**Nothing about the clock setup changes.** `set_I2S_sample_freq` already computes
+`mclk = rate * bits * 2`, and that `*2` IS the stereo frame — both slots are on the wire and being
+clocked today; the right one was simply read and discarded. No second `config_I2S`, no second
+`clkdiv`. `rx_force_left` must stay 0 (it is), or both slots collapse into the left FIFO.
+
+Wiring: mics share BCLK, LRCLK/WS and SDIN; SEL->GND picks left, SEL->VDD picks right. I2S mics
+tri-state during the other's slot, so one shared data line is correct.
+
+Three hazards the code has to handle, all of them silent if missed:
+
+1. **FIFO desynchronization.** `read_I2S_rx` blocks on empty, and the two sides have independent
+   FIFOs, so exactly one right read must accompany each left read, unconditionally. A skipped or
+   doubled read offsets the mics *permanently*, and a fixed inter-mic sample offset is exactly what
+   ruins every combine mode. Never make either read conditional on something that can differ
+   between the sides.
+2. **Per-mic DC.** These MEMS parts sit on a large per-part DC offset (~-98e6 counts measured on
+   this rig). DC must come off each mic *before* combining, or the sum adds two unrelated offsets
+   and the difference leaves their mismatch as a pedestal that swamps the speech.
+3. **Unwired second mic = hang, not error.** `read_I2S_rx` spins forever on an empty FIFO, so
+   probing it with a read would turn "mic not connected" into a silent hang indistinguishable from a
+   dead chip. `mic_probe_right()` polls the non-blocking `get_I2S_rx_empty` under a bounded spin at
+   boot and falls back to mono, printing `right slot ALIVE` / `SILENT -> falling back`.
+
+`DSP_CITRINET_MIC_COMBINE`: 0 = primary only (**the A/B control** — captures both, uses one, so the
+array can be measured against itself with everything else identical), 1 = average, 2 = difference,
+3 = cross-correlation-aligned sum.
+
+**Expected benefit, honestly:** averaging buys ~3 dB against *uncorrelated* noise (mic self-noise,
+ADC noise) because speech adds coherently while that noise adds in power. It does **nothing** for
+correlated noise — room tone, reverb, a competing talker — which is most real-room noise. Real
+directional rejection needs mode 2 (gradient, but it high-passes speech and is very sensitive to
+gain mismatch) or adaptive filtering. At 16 kHz one sample = 2.1 cm of path difference, so mode 3
+only does something when the mics are more than ~2 cm apart; closer than that it degenerates to
+mode 1. Do not expect a large WER change from two mics alone.
+
+The per-utterance log prints `array mode=N L=… R=… lag=…`, which is the diagnostic that matters: a
+dead, unwired or wrong-SEL second mic shows up as a near-zero or badly mismatched `R` level rather
+than as a mysteriously worse transcript.
+
+Cost: +218 KB .bss, one extra FIFO read per sample pair. The capture is I/O-bound on the mic clock,
+so it does not slow anything down. Mono `.bss` verified byte-identical with the option OFF.
+
+**Unproven:** no I2S_RIGHT read in this tree has ever carried real data (the only one is a discard
+in `dsp-i2s-test`), so the right FIFO carrying mic samples is the one genuinely new hardware claim
+here.
+
+### DESIGN (not built): directional VAD gate + 2-mic array, for background speech
+
+Agreed direction, deliberately not implemented yet. Written down so the reasoning survives.
+
+**The three failure modes background speech causes today**, in descending order of severity:
+
+1. **The gate captures the wrong talker.** The VAD is a pure energy gate on one mic, so a background
+   voice trips it and the demo confidently transcribes *them*. A confident wrong answer, not a
+   degraded one — this is the worst failure and it is a RELIABILITY bug, not an SNR bug.
+2. **The capture never ends.** The end-detect is the same energy gate, so continuous background
+   speech holds `energy >= END_THRESHOLD` and the hangover never completes. Every capture then runs
+   to the 51.2 k ceiling and transcribes 3.2 s of two overlapping voices. Latent today; background
+   talk is exactly what triggers it.
+3. **Overlapping speech degrades the transcript.** The graceful one.
+
+Note 1 and 2 are gating problems, not filtering problems — which is why the gate comes first.
+
+**The strategic point: one computation feeds everything.** Per VAD frame, cross-correlate the two
+mics over lag `+-L` and keep the peak lag `d_hat` and the normalized peak `gamma` (coherence). That
+single result gives the direction estimate (gate), the confidence that a source is near-field and
+on-axis (gate), and the delay needed to steer a beam or null (filter). Cost is `(2L+1) * 320` MACs
+per 20 ms frame — a few thousand, against 4.2 s of inference. Free.
+
+**Layering, in the order to build and measure them:**
+
+- **L1 — spatial features.** Per frame: `d_hat`, `gamma`, plus the existing per-mic energy. Log all
+  of them. This is pure instrumentation and ships first: the thresholds below must be tuned from
+  real recorded numbers, exactly as `VAD_THRESHOLD` was.
+- **L2 — directional gate.** Onset requires `energy > E_on AND gamma > G_on AND |d_hat - d_target|
+  <= tol`. Fixes failures 1 and 2, distorts nothing, and is independently testable. **Use the
+  direction-gated energy for the END-detect too**, or failure 2 survives.
+  Needs **hysteresis**: strict on onset, lenient on continuation. Your own unvoiced consonants drop
+  coherence, so a gate strict enough to reject an interferer will chop your own word endings if it
+  applies the same test mid-utterance. Pairs with the tail work above.
+  `d_target` is best **auto-calibrated** by a short enrollment at boot ("say something now") rather
+  than hardcoded from geometry.
+- **L3 — spatial filter.** Steered null on the interferer, applied only after the gate accepted the
+  utterance. Riskier: a plain difference high-passes speech and the mel front-end weights low
+  frequencies heavily, so this can cost more than it saves. Measure separately from L2 — building
+  both at once means not knowing which one helped.
+
+**Mic spacing is a real tension, and it pushes toward the gate.**
+- The *filter* wants `d < lambda/2` to avoid grating lobes: at 8 kHz that is **< 2.1 cm**.
+- The *gate* wants LARGE spacing for lag resolution: one sample = 2.14 cm at 16 kHz, so 3 cm gives
+  only about +-1.4 samples of usable lag — too coarse to discriminate direction.
+
+Recommended compromise **~5-6 cm**: gives +-2.5 samples for the gate, and clean spatial response
+below `c/2d` ~= 2.9 kHz, where most speech energy and most of the mel weighting live; above that the
+filter's response is ambiguous. Add **parabolic interpolation of the correlation peak** for
+sub-sample resolution — cheap, standard, and it buys back most of what small spacing costs.
+
+**If plain cross-correlation proves too reverb-sensitive, GCC-PHAT is nearly free here**: the log-mel
+front-end already has a working radix-2 FFT (`fft_init`/`fft_run`), so the transform is already
+written and paid for.
+
+**Honest expected outcome.** Failures 1 and 2 largely fixed — that is the big win, and it is about
+never confidently transcribing the wrong person, not about dB. True overlap improves only modestly:
+6-12 dB of interferer rejection in a real room (reverb, not the algorithm, is the limit), so WER
+under simultaneous speech still degrades. No 2-mic system solves the cocktail party. The demo should
+go from "confidently transcribes the other person" to "transcribes you, degraded when talked over" —
+a large qualitative improvement behind a modest SNR number.
+
+**Measurement harness is part of the work, not an afterthought:** combine mode 0 (single mic) vs
+gated vs gated+filtered, same room, same script, with the per-frame `(energy, d_hat, gamma)` log
+driving the threshold choices.

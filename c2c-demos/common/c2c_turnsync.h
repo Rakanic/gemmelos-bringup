@@ -87,13 +87,25 @@ static inline void c2c_wake_peer(void) {
   c2c_remote_write_u32((volatile uint32_t *)(uintptr_t)(C2C_PEER_MSIP_ADDR), 1u);
 }
 
-/* Sleep in wfi until the next timer tick (interval from now) OR an MSIP wake, whichever is first.
- * Re-arming mtimecmp each call schedules the next tick and clears any pending MTIP; clear our own
- * MSIP after waking so a stale pending bit can't spin us. */
-static inline void c2c_sleep_until_tick(void) {
-  c2c_set_mtimecmp(c2c_mtime() + (uint64_t)C2C_POLL_INTERVAL_TICKS);
+/* Sleep in wfi for `ticks` mtime ticks OR until an MSIP wake, whichever is first. Re-arming
+ * mtimecmp each call schedules the next tick and clears any pending MTIP; clear our own MSIP after
+ * waking so a stale pending bit can't spin us.
+ *
+ * The interval is a parameter because the right value depends on what is being waited FOR, and the
+ * cost of guessing low is not small: every wake costs at least one c2c_full_flush (a 256 KiB
+ * buffer walk), so a few-millisecond interval means the core is walking the cache continuously
+ * rather than sleeping. The timer is only a SAFETY NET for a dropped MSIP — the peer's wake still
+ * arrives immediately whatever this is set to — so a waiter expecting a slow peer should pick an
+ * interval measured against that peer's latency, not against the default. */
+static inline void c2c_sleep_ticks(uint64_t ticks) {
+  c2c_set_mtimecmp(c2c_mtime() + ticks);
   __asm__ volatile("wfi");
   c2c_clear_own_msip();
+}
+
+/* The default-cadence form, unchanged, as used by the KWS demos. */
+static inline void c2c_sleep_until_tick(void) {
+  c2c_sleep_ticks((uint64_t)C2C_POLL_INTERVAL_TICKS);
 }
 
 /* Block (timer-paced wfi) until the turn register in our OWN spad equals my_turn. Each wake (MSIP

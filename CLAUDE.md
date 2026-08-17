@@ -9,6 +9,67 @@ the living record of hardware behavior we've discovered on silicon. Respect it.
 
 ### Current focus
 
+- **C2C VOICE ASSISTANT WORKS ON SILICON (2026-08-16) — Citrinet (DSP) -> SmolLM (BML) over the
+  link (plan `.claude/plans/010-c2c-voice-assistant.md`).** Speak at the DSP mic -> `dsp-citrinet-c2c` transcribes with Citrinet-256 -> the TEXT
+  crosses the C2C link -> `bearly-smollm-c2c` answers it with SmolLM2-135M-Instruct -> the answer
+  comes back and prints on the DSP console too. This is plan 007 + plan 008 joined by the plan
+  001/002 link pattern.
+  - **Neither model was rewritten.** Both targets REUSE their standalone demo's sources (the
+    `bearly-kws-llama` precedent) behind `-DDSP_CITRINET_C2C=1` / `-DSMOLLM_C2C=1`, so the
+    transcription and generation paths cannot drift. Each adds exactly one file — `src/stt_link_dsp.c`
+    / `src/stt_link_bml.c` — over the shared protocol `c2c-demos/common/stt_link_proto.h`.
+    Standalone `dsp-citrinet` and `bearly-smollm` are unaffected.
+  - **The one protocol change that matters: the ack is split in two.** KWS's producer re-grants on
+    EVERY idle tick (~3.3 ms at 750 MHz) until acked — fine for a 16 Mcyc inference, wrong for a
+    SmolLM answer that takes MINUTES, because it would pour cross-link writes into a busy chip. So
+    BML writes a **receipt** (`rx_index`) as soon as the prompt verifies, WITHOUT giving up the turn;
+    the DSP then retransmits briskly only until the receipt lands (`STT_LINK_REGRANT_TICKS_PRE_RX`)
+    and rarely afterwards (`STT_LINK_REGRANT_IDLE_MS`, 10 s) — the slow poll still exists because a
+    dropped FINAL hand-back would otherwise deadlock the pair. **Use this shape for any C2C payload
+    whose consumer is slow.**
+  - **A waiter's poll interval is not free — budget it against `c2c_full_flush`.** Every wake costs
+    at least one 256 KiB evict walk (4096 lines x 3 passes), and the first version did FOUR per wake
+    at the turnsync default (~3.3 ms at 750 MHz), which does not fit in the interval: the DSP spent
+    the entire multi-minute generation walking its cache instead of sleeping. Fixed by
+    `c2c_sleep_ticks(n)` (new in `c2c_turnsync.h`; `c2c_sleep_until_tick()` is now a wrapper, so KWS
+    is unchanged) plus reading one word per wake instead of three — 36,036 wakes x 4 flushes -> 120
+    x 2 over a 120 s answer. The timer is only a SAFETY NET; the peer's MSIP still wakes you
+    instantly, so a long interval costs nothing but the latency of a *dropped* wake.
+  - Link timing knobs are in **milliseconds** (`STT_LINK_MS_TO_TICKS`), not ticks: `mtime` is
+    derived from the core clock, so a tick count means something different at every PLL setting.
+  - **The first run cost a lesson worth more than the demo: CMake cache-variable names are global.**
+    Reusing `dsp-citrinet`'s / `bearly-smollm`'s option names here silently inherited THEIR defaults
+    — the C2C Citrinet shipped scalar (`CITRINET_USE_RVV=OFF`, ~3.4x slower) and SmolLM shipped with
+    the memory probe on and a 200-token answer limit, with the build log printing the values that
+    were *intended*. All cache variables are now prefixed `CN_C2C_*` / `SMOLLM_C2C_*`, and the
+    measured conclusions from plan 007 (RVV on; CONV1D/MR6/PACK/DMA-staging/dual-core off) are plain
+    `target_compile_definitions` so no cache state can undo them. See the rule in
+    "`c2c-demos/` structure & conventions".
+  - **WAKE WORD "marvin", entirely on the DSP (2026-08-16, built, pending silicon).** An always-on
+    TinySpeech detector gates the expensive path — mic -> rolling 1 s MFCC window -> CNN -> only on
+    `marvin` does Citrinet run and a prompt cross the link. The TinySpeech runtime is pure C + RVV
+    (no `hal_ope`), so it compiles for dsp25 unchanged. Trained by the NEW
+    `dsp25-tests/tinyspeech-test/scripts/train_wakeword.py` as a DETECTOR: class 0 = `marvin`,
+    classes 1-5 = reject buckets (incl. background chopped from `_background_noise_`), so noise is
+    never forced into a keyword. Weights live in `dsp-citrinet-c2c/include/wake/weights.h` and win by
+    include ORDER over the shared 6-word `weights.h` — get that order wrong and the binary listens
+    for "tree". Decision = `logit[marvin] - max(other) > DSP_WAKE_MARGIN` (2.0) for
+    `DSP_WAKE_CONSECUTIVE` (2) windows; per-window false accept at margin 2 is 0.078%, and requiring
+    consecutive windows is what turns that into a usable rate. Hop is 160 ms because training
+    augments position by only ±100 ms. **Tune `DSP_WAKE_MARGIN` from the logged per-window margin**,
+    exactly as the VAD threshold is tuned.
+  - **Barge-in: a new question REPLACES one being answered.** The DSP bumps `prompt_index` and
+    re-publishes; BML checks between tokens *and between prefill passes* and abandons. The abandoned
+    prompt is never acked — the DSP stopped waiting the moment it published the replacement. This is
+    why the DSP API is now `stt_dsp_publish_prompt()` + `stt_dsp_poll()` (non-blocking), with
+    `wake_gate_listen()` calling `poll` once per hop so answers arrive while you are being listened
+    to.
+  - Console: `SMOLLM_C2C_QUIET` defaults ON (the conversation and link anomalies only);
+    `-DSMOLLM_C2C_QUIET=OFF` restores the banner and telemetry.
+  - Build: `make build CHIP=dsp25 PLATFORM=CHIP TARGET=dsp-citrinet-c2c EXTRA_CMAKE_ARGS="-DLINKER=llm"`
+    and `make build CHIP=bearly25 PLATFORM=CHIP TARGET=bearly-smollm-c2c EXTRA_CMAKE_ARGS="-DLINKER=llm"`.
+    **Start the DSP first** (the readiness announcement is one-shot by design). Both chips run at
+    750 MHz; the KWS demos proved the link at 500 — if it misbehaves, drop BOTH together.
 - **FULL C2C KWS DEMO WORKS END-TO-END ON SILICON (2026-07-22).** `dsp-kws-rolling` computes MFCC on
   DSP → streams the case over the C2C link → `bearly-kws-rolling` runs TinySpeech and correctly
   predicts `yes` on the embedded `yes_test_005` sample. This is the payoff of plans 001+002.
@@ -68,6 +129,37 @@ the living record of hardware behavior we've discovered on silicon. Respect it.
   lock if it corrupts), shared-vs-per-hart RVV unit. See the plan for the full collision-resolution
   writeup.
 
+- **SMOLLM2-135M-INSTRUCT ANSWERS QUESTIONS ON BEARLY ML 25 SILICON (plan
+  `.claude/plans/008-smollm-bearly.md`, 2026-08-15).** `c2c-demos/bearly-smollm` is the `borai`
+  TinyStories demo grown up: type a question over UART, get an answer from a real 135M instruct
+  model — `"hello"` -> `"hello! how can i help you today?"`. 143 MB of grouped-Q8_0 weights
+  `.incbin`'d into .rodata (flash it over the 30 MHz SPI loader, ~40 s; uart_tsi would be ~26 min),
+  ~24 MB of heap for the KV cache, stack pinned into real DRAM.
+  **Two silicon findings came out of it, both bigger than the demo:**
+  - **RVV `vwredsum` returns garbage** (see the bug log) — the first working flash produced fluent
+    nonsense until the int8 reduction was restructured to keep products in lanes and reduce in float.
+  - **It is 100% weight-bandwidth bound: ~55 cyc/byte to read the model, 61 to read AND multiply.**
+    143 MB/token = ~8.5 Gcyc = ~10 s/token at 750 MHz. Kernel choice barely matters; only reading
+    FEWER bytes does. Hence batched prefill (one weight pass for the whole prompt instead of one per
+    prompt token, `SMOLLM_MAX_BATCH`) — the single biggest win available, and the classifier is
+    skipped for all but the last prompt token. Needs the new **`platform/bearly25/bearly25-llm.ld`**
+  (`EXTRA_CMAKE_ARGS="-DLINKER=llm"`), which unlike `dsp25-llm.ld` keeps DRAM at its real 256 MB so the
+  stack cannot land past the end of memory, and declares heap/stack as bare symbols so uart_tsi does
+  not zero-fill ~100 MB of heap over the serial link.
+  Three things generalise beyond this demo:
+  1. **Keep the arithmetic in chip-free translation units.** `src/model.c` + `src/tokenizer.c` have no
+     chip dependencies, so `scripts/check_c_forward.py` / `check_c_tokenizer.py` compile *the exact
+     source that runs on silicon* for the host and diff it against a numpy reference and HuggingFace —
+     seconds per iteration instead of a 26-minute flash. This caught a latent link break and a
+     tokenizer question that inspection would not have.
+  2. **int8 inference is chaotic; only position 0 is reproducible.** A last-bit float difference
+     eventually flips one activation by one quantization step (measured: identical to ~1e-6 through
+     layer 13, then 6% apart by layer 28, then a different token). Judge a run by the position-0
+     golden check and by whether the text makes sense — never by equality with a reference token
+     stream.
+  3. **`PLATFORM=SIMS` must skip `init_test()`.** Spike models neither the PLL nor the UART, so
+     programming them faults before the first character prints and looks exactly like a hang.
+
 ---
 
 ## The two chips
@@ -81,7 +173,7 @@ Both are RISC-V SoCs built from the Chipyard ecosystem. Board bringup is done ov
 | Accelerator | `CONV2D` (2D conv, `hal_ope`) | `CONV1D`/DMA/I2S (`hal_conv`, `hal_dma`, `hal_i2s`) |
 | Role in C2C demos | **receiver / consumer** (bearly-*) | **producer / transmitter** (dsp-*) |
 | `SYS_CLK_FREQ` | 50 MHz (nominal) | 50 MHz (nominal) |
-| Linker scripts | `bearly25.ld`, `bearly25-maxheap.ld` | `dsp25.ld`, `dsp25-flash.ld`, `dsp25-scratch.ld` |
+| Linker scripts | `bearly25.ld`, `bearly25-maxheap.ld`, `bearly25-llm.ld` | `dsp25.ld`, `dsp25-flash.ld`, `dsp25-scratch.ld`, `dsp25-llm.ld` |
 | OpenOCD cfg | `platform/bearly25/bearly25.cfg` | `platform/dsp25/dsp25.cfg` |
 
 `platform/c2c25/chip_config.h` is nearly identical to `dsp25` and is where the C2C link
@@ -148,6 +240,9 @@ seconds.
   - `kws_proto.h` — KWS streaming mailbox + ring slots / fast case slots (`commit_seq`
     guards a partially-filled slot: 0 while filling, N when case N committed).
   - `kws_rolling_proto.h` — rolling-window KWS variant built on `kws_proto.h`.
+  - `stt_link_proto.h` — voice-assistant text link (transcript out, answer back). Same turn-taking
+    layout as `kws_stream_proto.h`, plus the **split ack** (`rx_index` receipt / `ack_index` done)
+    that keeps the link quiet while the consumer spends minutes generating.
 - **Commit-sequence handshake pattern** (used across simpletest/kws): producer fills a slot,
   fences, then writes `commit_seq = N` last; consumer waits for `commit_seq != 0` / expected N
   before reading the payload. Never reorder the commit write before the payload write.
@@ -295,7 +390,9 @@ make build CHIP=dsp25    TARGET=c2c-transfer-dsp
 make build CHIP=bearly25 TARGET=c2c-transfer-bearly
 ```
 
-C2C demo targets (`c2c-demos/CMakeLists.txt`): `dsp-kws`, `bearly-kws`, `dsp-kws-rolling`,
+C2C demo targets (`c2c-demos/CMakeLists.txt`): `membw`, `bearly-smollm`, `dsp-citrinet-c2c` +
+`bearly-smollm-c2c` (the voice assistant pair — mic -> Citrinet -> link -> SmolLM -> answer; both
+need `-DLINKER=llm`), `dsp-kws`, `bearly-kws`, `dsp-kws-rolling`,
 `bearly-kws-rolling`, `bearly-kws-llama` (dual-core KWS + TinyLlama voice control; bearly25 +
 `-DBUILD_VECNN=ON`), `dsp-i2s-test`, `dsp-simpletest`, `bearly-simpletest`, `c2c-measure`,
 `c2c-transfer-dsp`, `c2c-transfer-bearly`, `hello-wfi` (single-chip `wfi`/MSIP sanity — build
@@ -339,6 +436,20 @@ macros, `fence` + `cache_evict_all` around every shared-memory touch, `commit_se
 handshakes for multi-word payloads, and structured single-line log records
 (`key=value` pairs) so runs can be parsed after the fact.
 
+**NEVER reuse another demo's CMake cache-variable name.** `option()` and `set(... CACHE ...)` create
+**global** entries, and a second declaration of an existing name is a **NO-OP** — whichever
+`add_subdirectory` runs first wins. When a demo reuses a sibling's sources (the `bearly-kws-llama` /
+`dsp-citrinet-c2c` / `bearly-smollm-c2c` pattern), copying its option names silently inherits the
+sibling's DEFAULTS, and the `message(STATUS ...)` line prints the stale value back at you so the
+build log looks correct. This shipped `dsp-citrinet-c2c` with `CITRINET_USE_RVV=OFF` (scalar
+encoder, ~3.4x slower) and `bearly-smollm-c2c` with `SMOLLM_MEM_PROBE=ON` — neither visible anywhere
+(found 2026-08-16). Prefix every cache variable with the target's own name (`CN_C2C_*`,
+`SMOLLM_C2C_*`). Better still: anything that is a measured **conclusion** rather than a preference
+(RVV on; CONV1D / MR6 / PACK / DMA-staging / dual-core off) belongs in
+`target_compile_definitions`, not an option — then no cache state, stale or fresh, can undo it.
+A value two chips must agree on (e.g. the C2C payload sizes) belongs in the PARENT
+`c2c-demos/CMakeLists.txt`, declared once.
+
 ---
 
 ## Planning docs & skills
@@ -348,7 +459,16 @@ handshakes for multi-word payloads, and structured single-line log records
   `001-full-c2c-kws-stream.md` (KWS streaming design), `002-kws-turn-taking-sync.md` (DONE — sync
   ported + demo works end-to-end), `003-kws-multi-testcase.md` (active next: validate more sample
   recordings, then MFCC-scale match / int8 conv2 fix), `004-kws-llama-dualcore.md` (dual-core KWS +
-  TinyLlama voice control — built, pending silicon).
+  TinyLlama voice control — built, pending silicon), `005-whisper-dsp.md`, `006-moonshine-dsp.md`,
+  `007-citrinet-dsp.md` (Citrinet STT — passes on silicon), `008-smollm-bearly.md`
+  (SmolLM2-135M-Instruct on bearly25 — validated in Spike, pending silicon),
+  `010-c2c-voice-assistant.md` (Citrinet -> C2C -> SmolLM voice assistant — built, pending silicon;
+  read its "one real design difference from KWS" section before writing any C2C protocol whose
+  consumer is slow).
+- `.claude/plans/009-silicon-rtl-bug-list.md` collects the defects worth reproducing in RTL
+  simulation (RVV `vwredsum`, cross-hart non-coherence, the DRAM read-throughput anomaly, silent
+  hangs on bad accesses, the C2C link quirks, DMA strided gather, I2S watermark), each with the
+  discriminating evidence and a directed test. Add to it when a new silicon-only defect turns up.
 - If a repeatable workflow emerges (e.g. "bring up a new C2C demo", "parse a transfer log"),
   capture it as a skill rather than re-explaining each time.
 
@@ -357,6 +477,30 @@ handshakes for multi-word payloads, and structured single-line log records
 ## Known Code Bugs / TODO fixes
 
 Software defects to fix later (distinct from the hardware quirks below).
+
+### TinySpeech exports no FC bias — the deployed model is not the model that was trained
+- **Where:** `dsp25-tests/tinyspeech-test/scripts/rebuild_weights_simplecnn.py` (`_model_to_weight_dict`)
+  and `bearly25-bmarks/tinyspeech-mc/src/modules.c` (`fc_layer`).
+- **Issue:** the model trains with `nn.Linear(96, n)`, which HAS a bias, but the weight dict exports
+  `FC_WEIGHT` only and the runtime's `fc_layer(input, weights)` takes no bias argument. So the
+  classifier bias is silently dropped between PyTorch and the chip: on-silicon logits differ from the
+  trained model's by a per-class constant. Argmax survives it often enough that the 6-word KWS demo
+  works, which is why it went unnoticed.
+- **Why it matters more than it looks:** any decision with an ABSOLUTE threshold (a wake word, a
+  confidence gate) is calibrated on numbers the chip does not reproduce.
+- **Workaround:** the wake-word model (`scripts/train_wakeword.py`) trains with `bias=False`, so host
+  and chip are exactly equivalent. Fix the 6-word path by doing the same, or by exporting an FC_BIAS
+  tensor and teaching `fc_layer` to add it.
+- **Status:** avoided in the wake-word model; open for `rebuild_weights_simplecnn.py`.
+
+### `fc_layer` is hardcoded to 6 output classes
+- **Where:** `bearly25-bmarks/tinyspeech-mc/src/modules.c` — both the fp16 RVV path and its scalar
+  fallback are inside an `output_features == 6` branch, and `tinyspeech_prepack_fc96x6_weights`
+  likewise. A model with a different class count silently leaves the optimized, silicon-proven path.
+- **Rule:** keep TinySpeech models at 6 classes unless you are prepared to validate the generic path.
+  The wake-word detector uses 1 wake class + 5 reject buckets for exactly this reason — which also
+  happens to be a better detector than one lumped "not the wake word" class.
+- **Status:** worked around by construction.
 
 ### int8 TinySpeech conv2 kernel produces garbage on silicon (use the float pipeline)
 - **Where:** `bearly25-bmarks/tinyspeech-mc/src/tinyspeech_int8.c` — conv2 path (suspect the RVV
@@ -394,7 +538,13 @@ Software defects to fix later (distinct from the hardware quirks below).
 - **Still exposed:** `dsp-moonshine`, `dsp-whisper` and the tinyllama target all use `LINKER=llm`
   with 64 KiB stacks in that fragile window. They work today; they are one stack-size change away
   from not working.
-- **Status:** fixed in `dsp-citrinet`; open elsewhere.
+- **Avoided by construction on bearly25:** `platform/bearly25/bearly25-llm.ld` (added 2026-08-15 for
+  `c2c-demos/bearly-smollm`) declares DRAM as the REAL 256M, so a stack derived from the region end
+  is inside real memory. Copy that approach rather than dsp25-llm.ld's 2048M when a new chip needs an
+  `llm` variant; only declare an oversized region if a blob genuinely needs more than medany's ±2 GiB
+  reach, and then pin the stack with `--defsym`.
+- **Status:** fixed in `dsp-citrinet`, avoided in `bearly25-llm.ld`; open in the other `LINKER=llm`
+  demos.
 
 ### (RESOLVED, but read this before porting a demo) A stack overflow on this platform is SILENT and looks exactly like a flaky chip
 - **Where:** `c2c-demos/dsp-citrinet` — hit 2026-08-12; see `.claude/plans/007-citrinet-dsp.md`.
@@ -435,6 +585,121 @@ Software defects to fix later (distinct from the hardware quirks below).
 - **Workaround / rule:** what C2C (or other) code must do because of it.
 - **Status:** open / worked-around / fixed-in-hw / under-investigation.
 ```
+
+### [BOTH] CLINT `mtime` is derived from the core clock — `MTIME_FREQ` is only true at 50 MHz  (measured 2026-08-16, `membw` on dsp25)
+- **Symptom:** counting `rdcycle` over CLINT `mtime` ticks and scaling by `MTIME_FREQ` (50 kHz)
+  reports **49.99 MHz** on a chip whose PLL was programmed for 750 MHz. The measured ratio is
+  **exactly 1000 cycles/tick = `SYS_CLK_FREQ/MTIME_FREQ`**, and it does not change when the PLL does.
+- **What it means:** `mtime` ticks at core/1000, so its real frequency is **50 kHz x the PLL ratio**
+  (750 kHz at 750 MHz). It is NOT an independent time base and cannot measure the clock that drives
+  it. The PLL is fine — the console being legible proves it, since `init_test()` derives `UART0->DIV`
+  from the same target.
+- **Consequences, which are not cosmetic:**
+  - Every `msleep()` / `sleep_ms_blocking()` / CLINT-timer interval in this tree is **short by the
+    PLL ratio** at the operating clock. The KWS turn-sync "~50 ms" `HELLO_WFI_POLL_INTERVAL_TICKS`
+    safety net is really ~3.3 ms at 750 MHz. It still works (it is a liveness backstop, and firing
+    15x too often only costs wakeups), but nothing derived from `MTIME_FREQ` means what it says.
+  - Any ns / MB/s figure computed from the naive measurement is **15x wrong**, and it is wrong in the
+    direction that flips conclusions: a 3207-cycle DRAM RTT is 64 us at 50 MHz (needing ~33 lines in
+    flight to reach 33 MB/s) but 4.3 us at 750 MHz (needing ~2).
+- **Rule:** resolve the clock with **`c2c-demos/common/clock_probe.h`** — sample cycles-per-tick once
+  before `init_test()` and once after, and read `PLL->RATIO`/`PLLEN`/`BYPASS` and the
+  `RCC_CLOCK_SELECTOR` mux back. That distinguishes the three cases (mtime independent / mtime tracks
+  the core / PLL genuinely not engaged) which otherwise produce identical timing evidence. Prefer
+  metrics that are **ratios of cycle counts** (cyc/byte, overlap, lines-in-flight) — they are immune.
+  The only independent time reference on this chip is a stopwatch; `membw` prints its own total
+  runtime for exactly that cross-check.
+- **Status:** open (software must work around it); worth an RTL/`chip_config.h` fix.
+
+### [DSP 25] The RVV TinySpeech FLOAT kernels return garbage — build them scalar  (discovered 2026-08-16, measured on silicon)
+- **Symptom:** running TinySpeech on dsp25 with the RVV kernels, fed FIXED feature maps whose logits
+  were computed on the host from the same weights, every case was wrong: all 8 golden cases picked
+  the SAME class, the class RANKING was identical across completely different inputs (only the
+  magnitude moved), and magnitudes were 10-100x the reference (`max_diff` up to 245.56 against
+  logits that should span about +-10). Live wake margins read -85..-119 where the model's own range
+  on real audio is [-12.6, +9.5]. Rebuilt scalar, the same golden test passes with **max_diff = 0**
+  on all 8, and live margins immediately became sane.
+- **Scope:** dsp25, `bearly25-bmarks/tinyspeech-mc` FLOAT path (`TINYSPEECH_INT8_PIPELINE=0`) — i.e.
+  the path the KWS demos rely on, but they run it on **bearly25**, where it is fine. The DSP had
+  never run this CNN before `dsp-citrinet-c2c`; it only ever computed MFCC and streamed features.
+- **What the signature says:** a fixed output ranking that is independent of the input, scaled by
+  input magnitude, is what you get when the convolutions produce a spatially near-uniform map — so
+  the GAP vector is a constant profile and each logit collapses to `const * rowsum(FC[c])`. Suspect
+  the packed conv path (`tinyspeech_prepack_conv_weights`, only compiled under `__riscv_vector`).
+- **Workaround / rule:** compile ONLY the TinySpeech translation units with `-march=rv64imafd` via
+  `set_source_files_properties(... TARGET_DIRECTORY <tgt> PROPERTIES COMPILE_OPTIONS ...)`. That
+  undefines `__riscv_vector` and selects the scalar paths the project's RVV_TYPE=0 mode already
+  supports; the ABI is unchanged so it links normally, and other units (Citrinet's own RVV kernels)
+  keep their vectorization. ~240 ms per inference scalar, which is fine for a gated one-shot.
+- **How to detect it:** `DSP_WAKE_GOLDEN_CHECK` in `c2c-demos/dsp-citrinet-c2c` — fixed inputs,
+  host-computed logits parsed from the deployed `weights.h`, got-vs-want printed at boot. **Copy
+  this pattern before trusting any NN kernel on a chip that has not run it before.** It separated
+  "the features are wrong" from "the maths is wrong" in a single flash, after a day of plausible
+  and entirely incorrect theories about the microphone.
+- **Status:** worked around (scalar); RTL/kernel root-cause open. Add to
+  `.claude/plans/009-silicon-rtl-bug-list.md`.
+
+### [BEARLY ML 25] ccache `WayEnable` reads 0 and ignores writes — this is NOT a problem  (checked 2026-08-15)
+- **What it looks like:** the cache controller at `0x02010000` reports `Config=0x06080802` (2 banks,
+  8 ways, 256 sets, 64 B lines = 256 KB) with `WayEnable=0`, and writing 7 reads back 0 — i.e.
+  apparently one way enabled.
+- **Reality:** this is the OPEN-SOURCE SiFive cache, where **all ways are always active** and
+  `WayEnable` is not the gating control it is on the commercial IP. The full 256 KB is in use.
+  Recorded here only so the "most of the L2 is disabled" reading does not get re-derived — it is
+  wrong, and the slow memory path (below) has nothing to do with cache capacity.
+
+### [BEARLY ML 25] Memory streams at ~31.6 cyc/byte and one line-fill at a time  (measured 2026-08-15)
+- **Symptom:** reading DRAM costs ~55 cyc/byte with 32-byte loads and ~31.6 with 64-byte (full-line)
+  loads; wider loads gain nothing, and 2/4/8 interleaved streams get monotonically WORSE
+  (66/122/205 cyc/byte). Heap and `.rodata` are identical, so it is not a region property.
+- **Rule for any streaming kernel:** issue loads of exactly one cache line (`e8m2` at VLEN=256) and
+  use ONE sequential stream. In `bearly-smollm` that alone was worth **1.43x** on decode.
+- **Consequence for LLM work:** a model of M bytes costs ~M x 31.6 cycles per token, whatever the
+  kernel does. Only shrinking the model (int4) moves it further.
+- **CAVEAT on the multi-stream numbers above:** they were taken with a loop that consumes each load
+  with the very next instruction, so on an in-order core the misses cannot overlap *whatever* the
+  MSHR count is — the monotonic degradation is at least partly the loop. `membw` now reports the
+  dependent and independent forms side by side; use the independent one.
+- **How to re-measure** (`membw`, added 2026-08-15, reworked 2026-08-16):
+  `make build CHIP=<chip> PLATFORM=CHIP TARGET=membw EXTRA_CMAKE_ARGS="-DLINKER=chip"` then
+  `make tsi-run TTY=<tty> BINARY=build/c2c-demos/membw/membw.elf`. Reports the RESOLVED core clock
+  (see the `mtime` entry above — the naive measurement is 15x wrong), a pointer-chase latency curve,
+  **memory-level parallelism from N independent chases** (the gate: flat cycles-per-round as N rises
+  means the core overlaps N misses; linear scaling means one at a time, and then no wire clock can
+  saturate an off-chip link from the core), streaming read/write/copy at every RVV LMUL, dependent-vs-
+  independent stream sweeps, a stride sweep, and a **Little's Law verdict** (lines in flight sustained
+  vs lines required for a target MB/s, tabulated at both candidate clocks). Shared primitives in
+  `c2c-demos/common/mem_probe.h` + `clock_probe.h`, host-tested by
+  `c2c-demos/membw/test/host_mem_probe_test.c`; `bearly-smollm` prints the same numbers at boot
+  (`SMOLLM_MEM_PROBE=1`, default) plus **cyc/model-byte** per answer, which unlike tok/s does not
+  move with prompt or answer length. See `c2c-demos/membw/README.md`.
+- **No address translation is in play:** nothing in `glossy/`, `platform/` or `bmark-lib/` ever
+  writes `satp` — this is bare M-mode. So no knee in the latency curve is a TLB or page-walk effect,
+  and huge pages are not an available lever. The 256 KB -> 1 MB cliff is the LLC boundary.
+- **Status:** open; RTL entry 3.
+
+### [BEARLY ML 25] RVV `vwredsum.vs` (integer widening reduction) returns garbage — use a float-lane reduction  (discovered 2026-08-15, measured on silicon)
+- **Symptom:** an int8 matmul whose inner loop is `vwmul.vv` -> `vwredsum.vs` -> `vmv.x.s` produces
+  results unrelated to the correct answer. In `c2c-demos/bearly-smollm` it turned
+  `"hello! how can i help you today?"` into `"atimstakingstaking elephstakingarxiv kilow"` — fluent
+  garbage, not an obvious failure. Its on-chip benchmark, comparing kernels against a scalar
+  reference computed in the same boot, reports `matmul rowdot ... max_diff 2147483647/1e6` (a
+  saturated cast: the difference is enormous) while `matmul lane` and `matmul transp` report
+  `max_diff 0`.
+- **Scope:** bearly25 silicon. Not reproducible in Spike, which executes the same binary correctly —
+  so anything validated only in simulation will miss it.
+- **What it is NOT:** `vwmul.vv`, `vle8.v`, `vadd.vv`, `vfredusum.vs` and `vfmv.f.s` are all
+  exercised by the kernels that measure `max_diff 0`. The failing and passing kernels differ by
+  exactly `vwredsum.vs` and `vmv.x.s`. Float reductions are fine; the INTEGER widening reduction (or
+  the scalar readout right after it) is not.
+- **Almost certainly the same defect as the TinySpeech int8 conv2 bug below** (conv2 activation max
+  `M2 ~ INT32_MAX` out of an RVV microkernel, worked around with the float pipeline): same
+  signature, same instruction family, different demo.
+- **Workaround / rule:** never reduce int8 products with `vwredsum`. Keep the products IN LANES and
+  accumulate into a float vector, reducing once per output row with `vfredusum` — see
+  `dot_row_lane()` in `c2c-demos/bearly-smollm/src/model.c` (CMake: `SMOLLM_MATMUL_LANEFLOAT=1`,
+  the default). It is also no slower: both are weight-bandwidth bound anyway.
+- **Status:** worked around; RTL investigation queued in `.claude/plans/009-silicon-rtl-bug-list.md`.
 
 ### [C2C link] Cross-chip wake via CLINT MSIP works, but a single wake can drop and a dropped wake into a sleeping core is unrecoverable  (discovered 2026-07-12, proven on silicon)
 - **Symptom:** a chip can wake a `wfi`-sleeping peer by writing the peer's CLINT MSIP across the

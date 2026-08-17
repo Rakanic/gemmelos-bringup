@@ -38,6 +38,23 @@ target_compile_definitions(dsp-citrinet PRIVATE
   DSP_CITRINET_USE_MIC=${_CN_MIC}
   DSP_CITRINET_FROM_AUDIO=${_CN_FROM})
 
+# Two-microphone array on the L and R slots of ONE I2S channel (never two channels — each channel
+# has its own clock generator, and two drifting time bases destroy the inter-mic phase relationship
+# every combine mode depends on). Wiring and the combine modes are documented in citrinet_config.h.
+# Costs 218 KB of extra .bss and one extra FIFO read per sample pair; the capture is I/O-bound on
+# the mic clock, so it does not slow anything down.
+option(DSP_CITRINET_MIC_STEREO "Capture a second I2S mic on the same channel's right slot" OFF)
+set(_CN_STEREO 0)
+if(DSP_CITRINET_MIC_STEREO)
+  set(_CN_STEREO 1)
+  message(STATUS "dsp-citrinet: DSP_CITRINET_MIC_STEREO=1 (2-mic array, combine=${DSP_CITRINET_MIC_COMBINE})")
+endif()
+# 0 = primary mic only (A/B control), 1 = average, 2 = difference, 3 = cross-correlation-aligned sum.
+set(DSP_CITRINET_MIC_COMBINE 1 CACHE STRING "2-mic combine: 0=left 1=average 2=difference 3=aligned")
+target_compile_definitions(dsp-citrinet PRIVATE
+  DSP_CITRINET_MIC_STEREO=${_CN_STEREO}
+  DSP_CITRINET_MIC_COMBINE=${DSP_CITRINET_MIC_COMBINE})
+
 # PLL target frequency for PLATFORM=CHIP builds. init_test() programs the PLL to
 # (freq / SYS_CLK_FREQ) x 50 MHz and sets the UART divisor from it, so this one value drives both
 # the clock and the console. It also feeds the engine's cycles->ms conversion, so the two can't

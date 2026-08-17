@@ -138,6 +138,11 @@ int cn_run_validate(const void *blob, size_t blob_bytes, const float *audio, int
 /* Print token ids as text (SentencePiece detok via citrinet_vocab.h). */
 void cn_print_tokens_text(const char *tag, const int *toks, int n);
 
+/* Same detokenization into a caller-supplied buffer instead of the console — what a non-console
+ * consumer needs (the C2C demo forwards the transcript to Bearly ML 25 as an LLM prompt). Always
+ * NUL-terminates; returns the length written, excluding the NUL. */
+int cn_tokens_to_text(char *buf, int cap, const int *toks, int n);
+
 /* Per-kernel cycle profile (no-op unless built CN_PROFILE=1). */
 void cn_profile_report(void);
 void cn_profile_reset(void);

@@ -1822,6 +1822,27 @@ int cn_transcribe(const cn_model_t *m, const float *audio, int n_samples,
 }
 
 /* ---- detokenize --------------------------------------------------------------------------------- */
+/* Detokenize into a caller-supplied buffer. Same output as cn_print_tokens_text — SentencePiece
+ * pieces concatenated, the leading word-boundary space stripped — but as a string, which is what a
+ * consumer other than the console needs (the C2C demo sends this over the link as a prompt).
+ * Always NUL-terminates; returns the length written (excluding the NUL). */
+int cn_tokens_to_text(char *buf, int cap, const int *toks, int n) {
+  int o = 0, emitted = 0, lead_stripped = 0;
+  if (cap <= 0) return 0;
+  for (int i = 0; i < n; i++) {
+    const int t = toks[i];
+    if (t < 0 || t >= CV_N_VOCAB) continue;
+    for (int b = cv_offset[t]; b < cv_offset[t + 1]; b++) {
+      const unsigned char ch = cv_bytes[b];
+      if (!lead_stripped && !emitted && ch == ' ') { lead_stripped = 1; continue; }
+      if (o >= cap - 1) { buf[o] = '\0'; return o; }
+      buf[o++] = (char)ch; emitted = 1;
+    }
+  }
+  buf[o] = '\0';
+  return o;
+}
+
 void cn_print_tokens_text(const char *tag, const int *toks, int n) {
   printf("%s\"", tag);
   int emitted = 0, lead_stripped = 0;

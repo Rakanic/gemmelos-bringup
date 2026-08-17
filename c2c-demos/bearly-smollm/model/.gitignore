@@ -1,0 +1,2 @@
+# The exported blobs are 144 MB and reproducible from scripts/export_smollm.py — never commit them.
+*.bin
