@@ -58,6 +58,43 @@ the living record of hardware behavior we've discovered on silicon. Respect it.
     consecutive windows is what turns that into a usable rate. Hop is 160 ms because training
     augments position by only ±100 ms. **Tune `DSP_WAKE_MARGIN` from the logged per-window margin**,
     exactly as the VAD threshold is tuned.
+  - **DIRECTIONAL WAKE GATE — 3-element endfire array (2026-08-20, built, pending silicon).**
+    `src/mic_array.c` + `include/mic_array.h`; `-DCN_C2C_WAKE_ARRAY=OFF` is the single-mic A/B control.
+    Only wakes for someone in FRONT of the array: **point element 0 (ch1 left) at the user**, elements
+    1 and 2 behind it on one line at 2.15 cm. Reuses `dsp-mic-bench/src/mic_quality.c` verbatim
+    (chip-free, host-tested — both of its failure modes are invisible on silicon).
+    - **Gate on DIRECTION, not on level.** The array separates front from side by only **~2 dB**
+      (measured +2.78 dB on axis vs +0.85 dB at 57°) — that is the 4.3 cm aperture, not the code — so
+      an absolute energy threshold cannot separate "to the side" from "quiet": a loud side talker beats
+      a quiet front one. `DSP_WAKE_ARRAY_TAU_MIN` (0.70 = ±46° cone) gates on the measured per-gap lag,
+      which is a **ratio** and so is immune to loudness, range, and stale gain constants.
+      `DSP_WAKE_ARRAY_GAIN_DB_MIN` (the energy gate) is real but its absolute value moves with all
+      three, so it is a starting point — both are logged per onset on a `DIR` line.
+    - **Alignment is re-measured EVERY capture, and must be.** The FIFOs slip an integer sample
+      whenever the read loop stops (the classifier stops it for ~240 ms), so a boot-time alignment is
+      stale by the second onset. Per-capture re-measurement also self-heals whatever else drained the
+      FIFOs — including Citrinet's own single-mic capture, which drains one of the three.
+    - **Only the INSTRUMENT delay is removed; the acoustic lag must survive.** Taking it out would
+      steer the beam onto whoever is talking. Direction is solved from element 1 alone (same channel ⇒
+      no stream offset, no calibration constant) with the LEVEL cue breaking the front/back tie —
+      at 2.15 cm one gap is exactly 1.000 sample, so front and back differ by a whole sample and are
+      indistinguishable from the slip by timing alone.
+    - **The monitor loop stays single-element and un-beamformed** (it must still drain all three FIFOs).
+      Beamforming there would need an alignment measured from silence, and a 1-sample error at this
+      spacing points the beam at broadside — a mis-steered monitor would drop wake words half the time.
+      The gates therefore sit after capture and before the CNN, so an off-axis talker costs one
+      correlation instead of a full inference.
+    - **`CN_C2C_WAKE_VAD_THRESHOLD` replaced `DSP_WAKE_VAD_THRESHOLD` — a rename, on purpose.** The
+      onset is now measured on the array reference element (ch1 left), ~8.2 dB QUIETER than the mic it
+      used to watch (ch0 left, which is what this demo calls E2), so every previously tuned value is
+      meaningless, not merely stale. Since `set(... CACHE ...)` never overwrites an existing entry,
+      keeping the name would have silently built the old number while the status line printed the new
+      one — the /CLAUDE.md cache rule appearing as a correctness bug rather than a style one. The old
+      name now hard-errors with the conversion factor.
+    - Gain constants (`E1 -0.29`, `E2 -8.21` dB) must be measured **broadside AND at ≥30 cm**. At 4-5 cm
+      the same calibration asks for E2 = -15.5 on axis / -12.5 at 57° / -8.2 at broadside: that spread
+      is inverse-square over 4.3 cm of path difference, i.e. distance leaking into a level ratio.
+      Baking in a near-field number lets the REAR element dominate the sum and costs ~1 dB.
   - **Barge-in: a new question REPLACES one being answered.** The DSP bumps `prompt_index` and
     re-publishes; BML checks between tokens *and between prefill passes* and abandons. The abandoned
     prompt is never acked — the DSP stopped waiting the moment it published the replacement. This is
@@ -394,7 +431,17 @@ C2C demo targets (`c2c-demos/CMakeLists.txt`): `membw`, `bearly-smollm`, `dsp-ci
 `bearly-smollm-c2c` (the voice assistant pair — mic -> Citrinet -> link -> SmolLM -> answer; both
 need `-DLINKER=llm`), `dsp-kws`, `bearly-kws`, `dsp-kws-rolling`,
 `bearly-kws-rolling`, `bearly-kws-llama` (dual-core KWS + TinyLlama voice control; bearly25 +
-`-DBUILD_VECNN=ON`), `dsp-i2s-test`, `dsp-simpletest`, `bearly-simpletest`, `c2c-measure`,
+`-DBUILD_VECNN=ON`), `dsp-i2s-test`, `dsp-mic-bench` (mic audio-quality benchmark: fixed-window
+capture -> noise floor / SNR / crest / clipping / tone SINAD+THD, plus `-DMICB_MICS=1|2|4` to measure
+every mic, the combined signal and all pairwise coherence/lag from the SAME capture. `-DMICB_CAL_REPORT=ON`
+turns it into the 4-element ARRAY CALIBRATOR: it measures the per-element gain, the per-gap acoustic lag
+and the cross-channel stream offset, and prints them back as paste-ready `-D` flags with the run-to-run
+spread beside each. Two of the three need a specific source position to mean anything (gains BROADSIDE,
+geometry ON-AXIS) and getting it wrong yields plausible numbers rather than an error, so follow the
+4-pass procedure in its README. `MICB_MICS=4`
+spans two I2S channels, and its `TRACK` line — inter-mic lag measured in sub-blocks — is what decides
+whether two channels share a time base, since both BCLKs are integer dividers of the same core clock.
+Metrics are chip-free and host-tested; see its README), `dsp-simpletest`, `bearly-simpletest`, `c2c-measure`,
 `c2c-transfer-dsp`, `c2c-transfer-bearly`, `hello-wfi` (single-chip `wfi`/MSIP sanity — build
 with either `CHIP`), `dsp-hello-wfi`, `bearly-hello-wfi` (two-chip turn-taking ping-pong; the
 reference sync implementation). Each `<chip>-*` target must be built with the matching `CHIP=`.
@@ -585,6 +632,106 @@ Software defects to fix later (distinct from the hardware quirks below).
 - **Workaround / rule:** what C2C (or other) code must do because of it.
 - **Status:** open / worked-around / fixed-in-hw / under-investigation.
 ```
+
+### [DSP 25] The two I2S RX FIFOs of one channel slip an INTEGER SAMPLE against each other between captures — and `rx_en` cycling does not clear it  (discovered 2026-08-18, measured on silicon)
+- **Symptom:** with two mics on ch0's L/R slots and a **stationary** source, the measured inter-mic lag
+  is **bimodal, the two clusters exactly 1.00 sample apart** (e.g. `-0.70` and `+0.30`), flipping
+  coin-toss-randomly from one capture to the next. WITHIN a capture the lag is rock solid
+  (`TRACK spread` 0.07-0.13 samples, slope < 3 ppm), so it is not measurement noise. Reproduced across
+  four independent silicon logs in `c2c-demos/dsp-mic-bench`.
+- **Scope:** dsp25, any two slots read from separate RX FIFOs, whenever there is a gap between
+  captures (analysis + printing) long enough for the FIFOs to overflow. The KWS/Citrinet mic paths use
+  ONE slot and are unaffected; anything phase-sensitive across two slots is.
+- **Why the obvious fixes do not work:** a **fixed-count lockstep drain PRESERVES** any offset (it
+  removes the same number of blocks from each side). **Draining to empty cannot remove it either** —
+  the empty flag is per **64-bit block = 2 samples**, so "empty" still permits one leftover sample per
+  side, which is precisely the ±1. **Cycling `rx_en` via `set_I2S_en()` does NOT flush the FIFOs**
+  (measured: 4/8 runs still slipped with the drain-to-empty + `rx_en` cycle in place).
+- **Why it matters:** an endfire beamformer steers on a fixed delay, so a 1-sample slip at 16 kHz
+  (2.15 cm of apparent path difference) mis-steers it — a 1-sample cardioid gets its null pointed at
+  the source about half the time. Measured consequence: mis-aligned runs attenuate signal and noise
+  equally (`d_rms ≈ d_nf`, `d_snr ≈ 0` — just a volume cut), aligned runs show the directional gain.
+- **Workaround / rule:** the hardware cannot resolve it (measured lag = true + slip is two unknowns
+  from one number), but the OPERATOR can, because the physical range is tiny — 2.2 cm of spacing
+  permits only ±1.02 samples of true lag. State the geometry (`MICB_EXPECTED_LAG`) and correct the
+  integer difference in software right after capture, before any analysis. **Source ON AXIS is
+  self-disambiguating** (true lag sits at the edge of the physical range, ±1.0; the slipped
+  alternatives are 0 = broadside, contradicting the setup, or ±2 = impossible). **A BROADSIDE /
+  equidistant source is the one geometry where the slip is unresolvable** — never run a
+  phase-sensitive measurement there. See `mic_fix_slip()` in `c2c-demos/dsp-mic-bench/src/main.c`.
+- **THE ~11-SAMPLE CROSS-CHANNEL STREAM OFFSET IS REAL (settled 2026-08-20 on the SOLDERED board).**
+  The mics are now soldered colinear at 2.15 cm, which puts M2 **4.30 cm** from M0 and therefore
+  permits **±2.00 samples** of acoustic lag — a hard ceiling set by the board, not by where the source
+  is. Measured M2-M0: **11.2 samples** (R = 0.94 over 8 captures). That is **5.6x the bound**, and even
+  allowing a whole sample of slip, **~8 samples cannot be sound**. The `ALIGN` and `SETUP` lines now
+  state this themselves rather than requiring the spacing arithmetic by hand.
+  Corroboration from coherence: on the earlier breadboard the cross-channel pairs read **0.11-0.38**
+  and now read **0.76-0.96**, exactly the rise `sin(kd)/(kd)` predicts for mics brought from far apart
+  to 4.3 cm — while the LAG stayed at ~11 samples through both layouts. A quantity that survives a
+  large change in geometry is not geometry.
+  **What is still unexplained is the MECHANISM: it is not the ch-start gap.** 11.6 samples is 725 us
+  while the measured gap between configuring the two channels is 0.25-8.6 us — 85x too small. So the
+  offset comes from something else (FIFO fill state at enable, or WS frame alignment), and the
+  "it varies per boot because the gap varies" reasoning was worthless. Worth an RTL look.
+  **Retracted, and the retraction's error is worth remembering:** this entry previously argued the
+  offset was 25 cm of air because "11.6 samples = 24.9 cm matches the 24.8 cm the pair lines printed."
+  That is CIRCULAR — the bench computes those cm FROM the lag, so it is the same number in different
+  units, not independent evidence. The real question was whether the mics could physically be 24 cm
+  apart, which only the board can answer. Superseded reasoning follows:
+- **(SUPERSEDED) The offset read as 25 cm of air on the breadboard (2026-08-19).** The reasoning below concluded that the two I2S channels' streams
+  start a fixed ~11.6 samples apart. Three numbers say otherwise: (1) 11.6 samples at 16 kHz is
+  **725 us**, while the measured ch-start gap is **0.25-8.6 us** at 750 MHz — the configure skew is
+  **85x too small**, so there is no mechanism; (2) 11.6 samples of SOUND is **24.9 cm**, and the pair
+  lines printed **24.7-25.1 cm**, an exact match; (3) diffuse-field coherence `sin(kd)/(kd)` predicts
+  **0.97-0.99 at 2.15 cm** (measured 0.98 within a channel) and **0.03-0.34 at 24.9 cm** (the first
+  cross-channel reading was 0.11-0.38). All three fit "the ch0 mic pair sat ~25 cm from the ch1 pair",
+  which it plausibly did on a breadboard. The intra-pair lags were correct (0.92-0.94 samples ~ 2.15 cm)
+  precisely because each PAIR was built right; only the two pairs were far apart.
+  **THE TEST, once ch0 works again: place all four colinear at 2.15 cm and re-measure. M2-M0 should
+  read ~2 samples, not ~13.6.** If it does, there is no stream offset, `MICB_ALIGN_FRAC` has nothing to
+  correct, and the fractional-delay concern evaporates. **The ±1 integer slip is a separate and
+  independently proven finding** — the bimodal clusters exactly 1.000 apart appear in every log,
+  including single-channel M0/M1 ones — so per-element alignment is still required.
+  Superseded reasoning, kept because the measurement itself was sound:
+- **ACROSS TWO CHANNELS the same defect appears as a CONSTANT ~11.6-SAMPLE OFFSET on top of the ±1
+  slip** (measured 2026-08-18, 4 mics). With the lag search at its usual ±4 every cross-channel pair
+  pinned at exactly the limit and coherence read 0.11-0.38, which looks exactly like "the two channels
+  do not share a time base" and is not: widening `MICB_MAX_LAG` to 256 found the peak at **13.6 / 12.7
+  samples**, and subtracting the known acoustic geometry gives a **channel offset of ~11.6 samples
+  (~725 us), stable across all 8 runs**. Coherence immediately recovered to **0.46-0.82**, i.e.
+  comparable to a within-channel pair. Two lessons: (1) **a lag pinned at the search limit is not a
+  measurement** — always widen the window before concluding anything about coherence; (2) the channels
+  ARE mutually coherent, so a multi-channel array is viable, but the offset is **not an integer** (the
+  ~0.6-sample remainder needs a fractional-delay filter, and it is comparable to the 1-sample endfire
+  delay at 2.15 cm spacing) and it **may differ per boot** — the ch-start gap itself was 3208 cycles on
+  one boot and 6422 on the next — so measure it at boot rather than baking in a constant.
+- **GENERALISED PER ELEMENT for the 4-mic array (2026-08-19).** `mic_align_all()` in
+  `c2c-demos/dsp-mic-bench` now aligns EVERY element against M0 rather than only the M0/M1 pair, which
+  the array cannot work without — each stream carries its own independent slip, so summing four raw
+  streams sums four differently-shifted copies of one sound (that is the whole of the `d_nf = +3.9 dB`
+  anomaly, i.e. averaging making the noise floor WORSE). The decomposition that makes it tractable:
+  `L(m) = acoustic(m) + channel_offset(m) + slip(m)`, where `acoustic(m) = m * MICB_EXPECTED_LAG`
+  exactly for a uniform linear array in a plane wave (so ONE operator number describes the geometry)
+  and must SURVIVE — it is the beam. **The integer part of the channel offset is not separable from the
+  slip, and does not need to be:** removing their sum every run leaves the element aligned whatever the
+  split was, and survives a boot that changed the offset. Only the FRACTION needs care, and it is
+  slip-immune (a slip moves a lag by exactly 1.000), so one coherent capture measures it — corrected
+  from a SESSION MEAN, never per run, because a per-run fractional correction makes the array track the
+  talker, and a beamformer whose look direction follows the source is not a beamformer.
+- **Correcting the fraction is worth ~4:1, measured, and needs a CUBIC interpolator.** Host test
+  (`mq_shift_advance` in `mic_quality.c`, chip-free so it is testable): leaving a 0.4-sample
+  misalignment costs **~8%** of inter-element coherence on a full-band signal; the two interpolations
+  that remove it cost **~2%**. Linear interpolation was NOT good enough — it is a one-zero low-pass,
+  -3.0 dB at 4 kHz for a 0.6-sample shift, which is itself a bigger coherence error than the
+  misalignment being corrected; 4-point Lagrange is -1.1 dB there. An exact integer shift is lossless
+  (gamma 1.000). Both have a zero at Nyquist — any even-length symmetric FIR does — so nothing above
+  ~7 kHz survives a fractional shift.
+- **A lag that comes back exactly at the search limit is not a measurement.** The `ALIGN` line now
+  refuses to shift on a saturated correlation and says so, because reading one as a lag is what turned
+  a too-small `MICB_MAX_LAG` into a day of believing the two I2S channels had no common time base.
+- **Status:** worked around in software (detected and corrected per element, never silently); root
+  cause open — needs an RTL look at whether the RX FIFOs can be flushed at all. Add to
+  `.claude/plans/009-silicon-rtl-bug-list.md`.
 
 ### [BOTH] CLINT `mtime` is derived from the core clock — `MTIME_FREQ` is only true at 50 MHz  (measured 2026-08-16, `membw` on dsp25)
 - **Symptom:** counting `rdcycle` over CLINT `mtime` ticks and scaling by `MTIME_FREQ` (50 kHz)

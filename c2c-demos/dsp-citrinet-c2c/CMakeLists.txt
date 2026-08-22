@@ -54,6 +54,12 @@ add_executable(dsp-citrinet-c2c
   ${_CN_SRC}/src/model_data.S
   src/stt_link_dsp.c
   src/wake_gate.c
+  src/mic_array.c
+  # dsp-mic-bench's signal primitives (correlation, DC removal, fractional shift), reused verbatim.
+  # That file is chip-free (math.h only) and covered by dsp-mic-bench/test/host_mic_quality_test.c,
+  # which matters here because both of its failure modes are invisible on silicon: a sign error in
+  # the shift direction, and a lag reported out of a saturated correlation search.
+  ${CMAKE_SOURCE_DIR}/c2c-demos/dsp-mic-bench/src/mic_quality.c
   # TinySpeech runtime. Pure C + RVV intrinsics — no hal_ope, nothing bearly-specific — so the same
   # sources the Bearly KWS demos use compile unchanged for dsp25. Not a library target: every demon
   # that uses TinySpeech compiles these directly, because each supplies its own weights.h.
@@ -165,6 +171,7 @@ target_include_directories(dsp-citrinet-c2c PRIVATE
   ${_CN_SRC}/include
   ${_TS_SRC}/include
   ${CMAKE_SOURCE_DIR}/c2c-demos/common
+  ${CMAKE_SOURCE_DIR}/c2c-demos/dsp-mic-bench/include   # mic_quality.h, for the array alignment
   ${CMAKE_SOURCE_DIR}/bmark-lib)
 
 # The top-level CMakeLists does a global add_compile_options(-O1) that lands AFTER Release's -O3,
@@ -269,18 +276,106 @@ message(STATUS "dsp-citrinet-c2c: command capture onset>${CN_C2C_VAD_THRESHOLD} 
 # decide whether it fires when you speak and stays quiet when you do not are the onset threshold and
 # the margin; tune both from the console, which logs the idle energy and every onset's margin.
 set(DSP_WAKE_MARGIN "2.0f" CACHE STRING "Wake margin: logit[marvin] - best other logit")
-set(DSP_WAKE_VAD_THRESHOLD "2.0e-4f" CACHE STRING "AC energy that counts as an onset")
+# RENAMED from DSP_WAKE_VAD_THRESHOLD, deliberately, and the rename is the point.
+#
+# This threshold is compared against energy measured on the ARRAY REFERENCE element (ch1 left), which
+# is a different physical microphone from the one it used to watch (ch0 left) and ~8.2 dB quieter. So
+# every previously-tuned value is not merely stale here, it is meaningless — 2.0e-4 on the loud mic is
+# only ~3.0e-5 of like-for-like sensitivity on this one. 1.0e-4 is then ~5 dB above that equivalent,
+# which is the deliberate raise; it rejects things that are QUIET, not things that are to the SIDE.
+#
+# A `set(... CACHE ...)` NEVER overwrites an existing entry, so keeping the old name would have left
+# any tree that had configured this demo before silently building the old number while the status line
+# below printed it back as if intended. A new name has no stale entry. (This is the /CLAUDE.md
+# cache-variable rule showing up as a correctness bug rather than a style one.)
+if(DEFINED DSP_WAKE_VAD_THRESHOLD)
+  message(FATAL_ERROR
+    "dsp-citrinet-c2c: DSP_WAKE_VAD_THRESHOLD is gone — use CN_C2C_WAKE_VAD_THRESHOLD.\n"
+    "The onset is now measured on the array reference element (ch1 left), ~8.2 dB quieter than the "
+    "mic the old name referred to, so a value tuned for it does not transfer. Divide the old value "
+    "by ~6.6 for like-for-like sensitivity, then raise from there.\n"
+    "If this fires on a tree you did not set it in, the value is stale in CMakeCache.txt: remove it "
+    "with `cmake -U DSP_WAKE_VAD_THRESHOLD <builddir>` or delete the build directory.")
+endif()
+# WHY 2.0e-5 AND NOT SOMETHING HIGHER. The energy is a variance, so a threshold T is a frame-RMS
+# floor of 10*log10(T) dBFS, which makes this checkable against measured speech instead of guessed:
+#     T=2.0e-4 -> -37.0 dBFS     T=3.0e-5 -> -45.2 dBFS
+#     T=1.0e-4 -> -40.0 dBFS     T=2.0e-5 -> -47.0 dBFS
+# The proven old config watched E2 and cleared it by 6.0 dB (E2 speech averaged -31.0 dBFS against a
+# -37.0 floor). E0 is 8.2 dB quieter — its speech averages -41.5 dBFS at 4-5 cm — so the SAME 6 dB of
+# margin lands at ~-47 dBFS, i.e. 2.0e-5. A first attempt at "raise it to reject the sides" used
+# 1.0e-4 = -40.0 dBFS, which is ABOVE average speech level on this mic and would simply have made the
+# gate deaf beyond close-talk range. Direction is rejected by DSP_WAKE_ARRAY_TAU_MIN; this knob only
+# sets how FAR AWAY the gate still hears, and raising it trades range for nothing else.
+# Lower it (1.0e-5 = -50 dBFS) for more range — the idle floor measures -60..-83 dBFS, so there is
+# room — and read the logged idle energy before going below that.
+set(CN_C2C_WAKE_VAD_THRESHOLD "2.0e-5f" CACHE STRING "AC energy on the array reference element that counts as an onset")
 set(DSP_WAKE_PREROLL_SAMPLES 3200 CACHE STRING "Audio kept from before the onset (3200 = 200 ms)")
 set(DSP_WAKE_LOG_EVERY 250 CACHE STRING "Log idle energy every N 20 ms frames (0 = never)")
 set(DSP_WAKE_DEBUG_FEATURES 0 CACHE STRING "Dump raw logits every Nth onset (0 = off)")
 target_compile_definitions(dsp-citrinet-c2c PRIVATE
   DSP_WAKE_MARGIN=${DSP_WAKE_MARGIN}
-  DSP_WAKE_VAD_THRESHOLD=${DSP_WAKE_VAD_THRESHOLD}
+  DSP_WAKE_VAD_THRESHOLD=${CN_C2C_WAKE_VAD_THRESHOLD}
   DSP_WAKE_PREROLL_SAMPLES=${DSP_WAKE_PREROLL_SAMPLES}u
   DSP_WAKE_LOG_EVERY=${DSP_WAKE_LOG_EVERY}u
   DSP_WAKE_DEBUG_FEATURES=${DSP_WAKE_DEBUG_FEATURES}u)
-message(STATUS "dsp-citrinet-c2c: wake word `marvin` onset>${DSP_WAKE_VAD_THRESHOLD} "
+message(STATUS "dsp-citrinet-c2c: wake word `marvin` onset>${CN_C2C_WAKE_VAD_THRESHOLD} "
                "margin>${DSP_WAKE_MARGIN} preroll=${DSP_WAKE_PREROLL_SAMPLES}")
+
+# ---- endfire microphone array -------------------------------------------------------------------
+# Directional wake gate: three colinear elements 2.15 cm apart, beam out past element 0.
+#
+# Cache names are prefixed CN_C2C_ per the rule in /CLAUDE.md — option()/set(CACHE) entries are
+# GLOBAL and a second declaration of an existing name is a silent no-op, so an unprefixed name here
+# could inherit a sibling demo's default and print the intended value back at you anyway.
+#
+# The two GEOMETRY numbers (spacing, endfire delay) and the two GAIN numbers are measured facts about
+# this board, not preferences, so they get plain defaults rather than being left to chance. The gain
+# constants in particular must be measured BROADSIDE AND AT RANGE (>= 30 cm); a near-field
+# calibration bakes in distance as if it were sensitivity and costs ~1 dB of front/side separation.
+option(CN_C2C_WAKE_ARRAY "Directional (endfire array) wake gate; OFF = single microphone" ON)
+set(_CN_WAKE_ARRAY 0)
+if(CN_C2C_WAKE_ARRAY)
+  set(_CN_WAKE_ARRAY 1)
+endif()
+set(CN_C2C_WAKE_ARRAY_CHANNEL   1 CACHE STRING "I2S channel carrying elements 0 (left) and 1 (right)")
+set(CN_C2C_WAKE_ARRAY_CHANNEL_B 0 CACHE STRING "I2S channel carrying element 2 (left slot)")
+if(CN_C2C_WAKE_ARRAY_CHANNEL STREQUAL CN_C2C_WAKE_ARRAY_CHANNEL_B)
+  message(FATAL_ERROR "dsp-citrinet-c2c: the two array I2S channels must differ")
+endif()
+# The direction gate. tau is cos(angle off the array axis), so 0.70 accepts a +-46 deg front cone.
+# This is the robust gate: a lag ratio does not move with source loudness, range, or stale gains.
+set(CN_C2C_WAKE_ARRAY_TAU_MIN "0.70f" CACHE STRING "Min per-gap acoustic lag: 1=on axis, 0=broadside")
+# The energy gate, i.e. the array's own gain. Measured +2.78 dB on axis vs +0.85 dB at 57 deg, so
+# 1.80 sits in the gap — but the ABSOLUTE level shifts with the gain calibration and the range, so
+# treat this as a starting point and read the console. -100.0f disables it.
+set(CN_C2C_WAKE_ARRAY_GAIN_DB_MIN "1.80f" CACHE STRING "Min array gain in dB for an onset to classify")
+set(CN_C2C_WAKE_ARRAY_GAIN_DB_E1 "-0.29f" CACHE STRING "Element 1 sensitivity vs element 0, dB")
+set(CN_C2C_WAKE_ARRAY_GAIN_DB_E2 "-8.21f" CACHE STRING "Element 2 sensitivity vs element 0, dB")
+# Element 2 crosses I2S channels and so carries the per-boot stream offset, measured at 7.4-12.9
+# samples; its search window must comfortably contain that. Element 1 shares a channel and can only
+# slip by +-2, and a wider search there can only find an aliased peak in periodic speech.
+set(CN_C2C_WAKE_ARRAY_MAX_LAG_CROSS 24 CACHE STRING "Lag search half-range, cross-channel element")
+set(CN_C2C_WAKE_ARRAY_MAX_LAG_SAME   4 CACHE STRING "Lag search half-range, same-channel element")
+target_compile_definitions(dsp-citrinet-c2c PRIVATE
+  DSP_WAKE_ARRAY=${_CN_WAKE_ARRAY}
+  DSP_WAKE_ARRAY_CHANNEL=${CN_C2C_WAKE_ARRAY_CHANNEL}
+  DSP_WAKE_ARRAY_CHANNEL_B=${CN_C2C_WAKE_ARRAY_CHANNEL_B}
+  DSP_WAKE_ARRAY_TAU_MIN=${CN_C2C_WAKE_ARRAY_TAU_MIN}
+  DSP_WAKE_ARRAY_GAIN_DB_MIN=${CN_C2C_WAKE_ARRAY_GAIN_DB_MIN}
+  DSP_WAKE_ARRAY_GAIN_DB_E1=${CN_C2C_WAKE_ARRAY_GAIN_DB_E1}
+  DSP_WAKE_ARRAY_GAIN_DB_E2=${CN_C2C_WAKE_ARRAY_GAIN_DB_E2}
+  DSP_WAKE_ARRAY_MAX_LAG_CROSS=${CN_C2C_WAKE_ARRAY_MAX_LAG_CROSS}
+  DSP_WAKE_ARRAY_MAX_LAG_SAME=${CN_C2C_WAKE_ARRAY_MAX_LAG_SAME})
+if(CN_C2C_WAKE_ARRAY)
+  message(STATUS "dsp-citrinet-c2c: endfire array ON — E0/E1 on I2S ch${CN_C2C_WAKE_ARRAY_CHANNEL}, "
+                 "E2 on ch${CN_C2C_WAKE_ARRAY_CHANNEL_B}; direction tau>${CN_C2C_WAKE_ARRAY_TAU_MIN} "
+                 "gain>${CN_C2C_WAKE_ARRAY_GAIN_DB_MIN} dB")
+  message(STATUS "dsp-citrinet-c2c: POINT ELEMENT 0 (ch${CN_C2C_WAKE_ARRAY_CHANNEL} left) AT THE USER "
+                 "— the beam looks out past it")
+else()
+  message(STATUS "dsp-citrinet-c2c: endfire array OFF — single-microphone wake gate")
+endif()
 
 # glossy (whole-archive) provides the dsp25 HAL (UART, I2S); m provides cosf/sinf/expf/logf/sqrtf.
 # mfcclib is the MFCC front-end the wake gate runs per window.

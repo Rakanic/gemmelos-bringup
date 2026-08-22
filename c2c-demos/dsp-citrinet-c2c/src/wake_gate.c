@@ -43,6 +43,10 @@
 #include "rocketcore.h"
 #include "hal_i2s.h"
 
+#if DSP_WAKE_ARRAY
+#include "mic_array.h"
+#endif
+
 _Static_assert(WAKE_NUM_CLASSES == TINYSPEECH_NUM_CLASSES,
                "the wake model's class count must match the TinySpeech runtime's");
 _Static_assert(WAKE_MFCC_DIM <= MFCC_DRIVER_NUM_DCT,
@@ -57,7 +61,9 @@ _Static_assert(DSP_WAKE_PREROLL_SAMPLES < WAKE_WINDOW_SAMPLES,
 /* All static: multi-KB objects on the stack are how this platform produces silent, irreproducible
  * corruption (see the LINKER=llm entry in /CLAUDE.md). */
 static float32_t g_audio[WAKE_WINDOW_SAMPLES];
+#if !DSP_WAKE_ARRAY
 static float32_t g_preroll[DSP_WAKE_PREROLL_SAMPLES];
+#endif
 static float32_t g_frames[WAKE_FRAMES * WAKE_MFCC_DIM];   /* frame-major: [frame][coeff] */
 static int8_t    g_case[WAKE_FRAMES * WAKE_MFCC_DIM];     /* coeff-major, the model's layout */
 static float32_t g_fft_in[MFCC_DRIVER_FFT_LEN];
@@ -78,7 +84,9 @@ static uint32_t g_events;      /* onsets that reached the classifier */
  * and it was NOT — injecting up to 20x full-scale DC on the host moves the margin only within
  * [-6, +5]. The real cause was the RVV kernels. Kept because it is correct, not because it fixed
  * that. */
+#if !DSP_WAKE_ARRAY
 static float32_t g_dc;
+#endif
 
 static inline uint64_t rdcycle64(void) {
   uint64_t x;
@@ -89,6 +97,7 @@ static inline uint64_t rdcycle64(void) {
 uint64_t wake_gate_last_cycles(void) { return g_last_cycles; }
 float    wake_gate_last_margin(void) { return g_last_margin; }
 
+#if !DSP_WAKE_ARRAY
 /* One 64-bit RX block = two consecutive samples of the primary mic, scaled to ~[-1,1]. Identical
  * arithmetic to dsp-citrinet's capture path (same config macros), so the wake window and the
  * command utterance that follows it are on the same scale. */
@@ -99,6 +108,16 @@ static inline void mic_read_pair(float32_t *a, float32_t *b) {
   *b = (float32_t)(((int32_t)(uint32_t)(v >> 32)) >> DSP_CITRINET_MIC_SAMPLE_SHIFT) *
        (1.0f / DSP_CITRINET_MIC_FULLSCALE);
 }
+#else
+/* With the array, every element must be drained on every iteration or its FIFO overflows and the
+ * next capture's alignment is measured across a discontinuity. mic_array_monitor_pair does that and
+ * hands back the REFERENCE element's two samples, so the energy test below is unchanged in form —
+ * it just watches E0 instead of dsp-citrinet's primary mic. See the threshold note in wake_config.h:
+ * E0 is a different, ~8 dB quieter mic, so the number moved for two reasons at once. */
+static inline void mic_read_pair(float32_t *a, float32_t *b) {
+  mic_array_monitor_pair(a, b);
+}
+#endif
 
 /* MFCC for one frame of the captured window into g_frames[frame_idx]. */
 static void compute_frame(uint32_t frame_idx) {
@@ -252,27 +271,50 @@ int wake_gate_init(void) {
 
   memset(g_audio, 0, sizeof(g_audio));
   memset(g_frames, 0, sizeof(g_frames));
+#if !DSP_WAKE_ARRAY
   g_dc = 0.0f;
+#endif
   g_events = 0u;
+
+#if DSP_WAKE_ARRAY
+  /* The array brings up the second I2S channel and probes all three slots. A local peripheral only —
+   * no cross-link traffic — so app_init is a legal place for it (see the boot rule in /CLAUDE.md). */
+  if (mic_array_init() != 0) {
+    DSP_CITRINET_LOG("[wake] array init FAILED — rebuild with -DCN_C2C_WAKE_ARRAY=OFF to fall back "
+                     "to the single-microphone gate\n");
+    return -1;
+  }
+#endif
 
   DSP_CITRINET_LOG("[wake] gate ready: onset>%d/1e6, window %u ms (pre-roll %u ms), margin > %d/100\n",
                    (int)lrintf((float)DSP_WAKE_VAD_THRESHOLD * 1.0e6f),
                    (unsigned)(WAKE_WINDOW_SAMPLES / (WAKE_SAMPLE_RATE_HZ / 1000u)),
                    (unsigned)(DSP_WAKE_PREROLL_SAMPLES / (WAKE_SAMPLE_RATE_HZ / 1000u)),
                    (int)lrintf((float)DSP_WAKE_MARGIN * 100.0f));
+#if DSP_WAKE_ARRAY
+  DSP_CITRINET_LOG("[wake] direction gate: tau > %d/100 (%d deg cone), array gain > %d/100 dB\n",
+                   (int)lrintf((float)DSP_WAKE_ARRAY_TAU_MIN * 100.0f),
+                   (int)lrintf(acosf((float)DSP_WAKE_ARRAY_TAU_MIN) * (180.0f / 3.14159265f)),
+                   (int)lrintf((float)DSP_WAKE_ARRAY_GAIN_DB_MIN * 100.0f));
+#endif
   return 0;
 }
 
 void wake_gate_listen(int (*poll)(void)) {
   const uint32_t FR = DSP_WAKE_VAD_FRAME_SAMPLES;
+#if !DSP_WAKE_ARRAY
   const uint32_t PRE = DSP_WAKE_PREROLL_SAMPLES;
+#endif
 
   DSP_CITRINET_LOG("[wake] listening — say the wake word.\n");
 
   for (;;) {
-    uint32_t ring_pos = 0u, ring_filled = 0u, frames_seen = 0u;
+    uint32_t frames_seen = 0u;
     float32_t onset_energy = 0.0f;
+#if !DSP_WAKE_ARRAY
+    uint32_t ring_pos = 0u, ring_filled = 0u;
     uint32_t w;
+#endif
 
     /* ---- monitor ------------------------------------------------------------------------------
      * Cheap: read a 20 ms frame, take its AC energy, keep it in the pre-roll ring. No MFCC, no CNN.
@@ -284,23 +326,31 @@ void wake_gate_listen(int (*poll)(void)) {
       for (uint32_t i = 0; i < FR; i += 2u) {
         float32_t a, b;
         mic_read_pair(&a, &b);
+#if !DSP_WAKE_ARRAY
         g_preroll[ring_pos] = a; ring_pos = (ring_pos + 1u) % PRE;
         g_preroll[ring_pos] = b; ring_pos = (ring_pos + 1u) % PRE;
+#endif
         sum += a + b;
         sumsq += (a * a) + (b * b);
       }
+#if !DSP_WAKE_ARRAY
       if (ring_filled < PRE) {
         ring_filled += FR;
         if (ring_filled > PRE) { ring_filled = PRE; }
       }
+#endif
 
       const float32_t mean = sum / (float32_t)FR;
       float32_t energy = (sumsq / (float32_t)FR) - (mean * mean);
       if (energy < 0.0f) { energy = 0.0f; }
 
+#if !DSP_WAKE_ARRAY
       /* The mean of a quiet frame IS the microphone's DC offset; track it here rather than in the
-       * captured window, where speech would bias it. */
+       * captured window, where speech would bias it. With the array this is unnecessary: each
+       * element carries its own offset and mic_array_beamform removes them per element, which is
+       * strictly better than one shared estimate. */
       g_dc += 0.05f * (mean - g_dc);
+#endif
 
       /* Service the C2C link while we wait. This is why the DSP can collect an answer to an earlier
        * question, or replace one still being generated, without ever stopping listening. */
@@ -326,6 +376,54 @@ void wake_gate_listen(int (*poll)(void)) {
      * Pre-roll first, so the window starts BEFORE the onset and the word's attack is inside it —
      * which also puts the word roughly where it sits in a training clip. Then fill the remainder
      * with fresh audio. Blocking reads only; nothing else runs, so the window is contiguous. */
+#if DSP_WAKE_ARRAY
+    /* ---- capture, align, beamform, then gate on DIRECTION ---------------------------------------
+     * The two directional gates sit HERE, before the classifier, for two reasons. They need the
+     * beamformed window (the array's gain and the source angle are properties of a whole capture,
+     * not of a 20 ms monitor frame), and putting them ahead of the CNN means an off-axis talker costs
+     * one correlation instead of a full inference.
+     *
+     * The monitor loop deliberately stays single-element and un-beamformed: beamforming there would
+     * need an alignment measured from silence, and a 1-sample alignment error at this spacing points
+     * the beam at broadside — so a mis-steered monitor would drop wake words about half the time. */
+    {
+      mic_array_info_t info;
+
+      (void)mic_array_capture(WAKE_WINDOW_SAMPLES);
+      mic_array_beamform(g_audio, WAKE_WINDOW_SAMPLES, &info);
+
+      DSP_CITRINET_LOG("[wake] DIR tau=%d/100 (%d deg) gain=%d/100dB elems=%u "
+                       "lag=%d/100,%d/100 shift=%+d,%+d gamma=%d/100,%d/100 lvlE1=%d/100dB %s\n",
+                       (int)lrintf(info.tau * 100.0f), (int)lrintf(info.angle_deg),
+                       (int)lrintf(info.gain_db * 100.0f), (unsigned)info.nused,
+                       (int)lrintf(info.lag[1] * 100.0f), (int)lrintf(info.lag[2] * 100.0f),
+                       info.shift[1], info.shift[2],
+                       (int)lrintf(info.gamma[1] * 100.0f), (int)lrintf(info.gamma[2] * 100.0f),
+                       (int)lrintf(info.lvl_db[1] * 100.0f),
+                       info.level_decided ? "level-resolved" : "broadside-assumed");
+
+      /* DIRECTION first: it is a lag ratio, so it is the one verdict that does not move with how
+       * loud or how close the talker is, nor with the gain constants going stale. */
+      if (!(info.tau >= (float)DSP_WAKE_ARRAY_TAU_MIN)) {
+        DSP_CITRINET_LOG("[wake] REJECT off-axis: %d deg, need < %d deg (tau %d/100 < %d/100)\n",
+                         (int)lrintf(info.angle_deg),
+                         (int)lrintf(acosf((float)DSP_WAKE_ARRAY_TAU_MIN) * (180.0f / 3.14159265f)),
+                         (int)lrintf(info.tau * 100.0f),
+                         (int)lrintf((float)DSP_WAKE_ARRAY_TAU_MIN * 100.0f));
+        continue;
+      }
+      /* Then the energy gate. If this rejects captures whose DIRECTION reads correct, the threshold
+       * is mis-set for your range and gain calibration, not the geometry — see wake_config.h. */
+      if (!(info.gain_db >= (float)DSP_WAKE_ARRAY_GAIN_DB_MIN)) {
+        DSP_CITRINET_LOG("[wake] REJECT low array gain: %d/100dB < %d/100dB (direction was on axis "
+                         "at %d deg — lower DSP_WAKE_ARRAY_GAIN_DB_MIN if this keeps happening)\n",
+                         (int)lrintf(info.gain_db * 100.0f),
+                         (int)lrintf((float)DSP_WAKE_ARRAY_GAIN_DB_MIN * 100.0f),
+                         (int)lrintf(info.angle_deg));
+        continue;
+      }
+    }
+#else
     w = 0u;
     {
       const uint32_t start = (ring_filled < PRE) ? 0u : ring_pos;
@@ -342,6 +440,7 @@ void wake_gate_listen(int (*poll)(void)) {
     for (uint32_t i = 0; i < WAKE_WINDOW_SAMPLES; ++i) {
       g_audio[i] -= g_dc;
     }
+#endif
 
     /* ---- classify ------------------------------------------------------------------------------
      * One inference per onset. Nothing is being tracked while this runs, so however long it takes
